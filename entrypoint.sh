@@ -55,7 +55,7 @@ child_life_time = 300
 EOF
 
     log "Waiting for Primary ($PRIMARY_HOST)..."
-    until pg_isready -h "$PRIMARY_HOST" -p 5432 > /dev/null 2>&1; do sleep 5; done
+    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
     
     log "Launching Pgpool-II..."
     exec pgpool -n -f "$PGPOOL_CONF" 2>&1
@@ -108,7 +108,7 @@ fi
 if [ "$NODE_ROLE" = "REPLICA" ]; then
     if [ ! -s "$PG_DATA/PG_VERSION" ]; then
         log "Replica: Initializing base backup from $PRIMARY_HOST..."
-        until pg_isready -h "$PRIMARY_HOST" -p 5432 > /dev/null 2>&1; do sleep 5; done
+        until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
         rm -rf "$PG_DATA"/*
         until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$PRIMARY_HOST" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=replica_slot; do
             warn "Backup in progress..."
