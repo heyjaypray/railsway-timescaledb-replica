@@ -50,9 +50,15 @@ backend_clustering_mode = 'streaming_replication'
 load_balance_mode = on
 master_slave_sub_mode = 'stream'
 
+# Session handling for pgx/Go compatibility
+statement_level_load_balance = on
+disable_load_balance_on_write = 'transaction'
+allow_sql_comments = on
+
 # Authentication: Pass-through
 enable_pool_hba = off
 pool_passwd = ''
+allow_clear_text_frontend_auth = on
 
 # Health Check & SR Check (Explicit database to fix status -2)
 health_check_period = 10
@@ -60,6 +66,8 @@ health_check_timeout = 30
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
+health_check_max_retries = 3
+health_check_retry_delay = 1
 auto_failback = on
 
 sr_check_period = 10
@@ -67,11 +75,15 @@ sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
 
-# Reduce log noise when replica is offline
+# Logging
 log_min_messages = warning
 
+# Connection pooling
 num_init_children = 32
 max_pool = 4
+child_life_time = 300
+connection_life_time = 0
+client_idle_limit = 0
 EOF
 
     log "Waiting for Primary ($PRIMARY_HOST)..."
