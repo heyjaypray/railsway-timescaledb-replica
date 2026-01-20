@@ -1,0 +1,51 @@
+{
+    "$schema": "https://railway.app/railway.schema.json",
+    "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile"
+    },
+    "deploy": {
+        "numReplicas": 1,
+        "restartPolicyType": "ON_FAILURE"
+    },
+    "params": {
+        "POSTGRES_PASSWORD": {
+            "label": "DB Password",
+            "config": {
+                "length": 32
+            }
+        }
+    },
+    "services": {
+        "timescale-primary": {
+            "name": "timescale-primary",
+            "variables": {
+                "NODE_ROLE": "PRIMARY",
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
+                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}"
+            },
+            "volumes": {
+                "/var/lib/postgresql/data": {}
+            }
+        },
+        "timescale-replica": {
+            "name": "timescale-replica",
+            "variables": {
+                "NODE_ROLE": "REPLICA",
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
+                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}"
+            },
+            "volumes": {
+                "/var/lib/postgresql/data": {}
+            }
+        },
+        "timescale-proxy": {
+            "name": "timescale-proxy",
+            "variables": {
+                "NODE_ROLE": "PROXY",
+                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}",
+                "REPLICA_HOST": "${{ timescale-replica.RAILWAY_INTERNAL_HOSTNAME }}"
+            }
+        }
+    }
+}
