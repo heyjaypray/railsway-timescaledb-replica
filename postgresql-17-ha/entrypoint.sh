@@ -115,10 +115,13 @@ END \$\$;
 -- Replication Slot
 SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
 WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+
+-- pg_cron extension (requires shared_preload_libraries, only works after real server start)
+CREATE EXTENSION IF NOT EXISTS "pg_cron";
 EOSQL
 
                 if [ $? -eq 0 ]; then
-                    log "Primary: User and replication configuration successful."
+                    log "Primary: User, replication, and extension configuration successful."
                     # Apply final HBA rules
                     cat > "$PG_DATA/pg_hba.conf" <<EOF
 local   all             all                                     trust
