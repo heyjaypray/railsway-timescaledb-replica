@@ -79,6 +79,12 @@ show pool_nodes;
 
 ---
 
+## Why Deploy TimescaleDB Replica (PostgreSQL) on Railway?
+
+Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.
+
+By deploying TimescaleDB Replica (PostgreSQL) on Railway, you are one step closer to supporting a complete full-stack application with minimal burden. Host your servers, databases, AI agents, and more on Railway.
+
 ## 📈 Optimization Pro-Tips
 
 ```sql
@@ -91,4 +97,10 @@ CREATE MATERIALIZED VIEW hourly_stats WITH (timescaledb.continuous) AS ...
 
 ---
 
-_Powered by Advanced Agentic Coding Architecture_
+## 📄 License
+
+This template is open-source and released under the [MIT License](LICENSE).
+
+---
+
+Powered by iCue
