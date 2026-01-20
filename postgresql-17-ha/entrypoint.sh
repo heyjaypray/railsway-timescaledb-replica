@@ -99,9 +99,6 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
                 ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
                 
                 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<EOSQL 2>&1
--- Reload config first to ensure 'cron.database_name' is recognized
-SELECT pg_reload_conf();
-
 -- Sync main user password
 ALTER USER "$POSTGRES_USER" WITH PASSWORD '$ESCAPED_PWD';
 
@@ -118,14 +115,11 @@ END \$\$;
 -- Replication Slot
 SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
 WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
-
--- Extensions
-CREATE EXTENSION IF NOT EXISTS "pg_cron";
-CREATE EXTENSION IF NOT EXISTS "pg_partman";
 EOSQL
 
                 if [ $? -eq 0 ]; then
-                    log "Primary: HA and Extension configuration successful."
+                    log "Primary: User and replication configuration successful."
+                    # Apply final HBA rules
                     cat > "$PG_DATA/pg_hba.conf" <<EOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
@@ -142,7 +136,7 @@ EOF
                     log "Primary: Maintenance task completed."
                     break
                 else
-                    warn "Primary: SQL tasks encountered an error (likely warming up), retrying in 5s..."
+                    warn "Primary: SQL tasks encountered an error, retrying in 5s..."
                 fi
             fi
             sleep 5
@@ -164,7 +158,7 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         log "Replica: Sync complete."
     fi
     
-    # APPEND to existing postgresql.auto.conf (don't overwrite!)
+    # Update postgresql.auto.conf (append/update)
     ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
     
     sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
@@ -172,19 +166,6 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
     echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD'" >> "$PG_DATA/postgresql.auto.conf"
     echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
     chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
-fi
-
-# Shared Configuration
-if [ -f "$PG_DATA/postgresql.conf" ]; then
-    log "Configuring postgresql.conf..."
-    sed -i "s/^logging_collector.*/logging_collector = off/" "$PG_DATA/postgresql.conf" || true
-    sed -i "/^shared_preload_libraries/d" "$PG_DATA/postgresql.conf" || true
-    echo "shared_preload_libraries = 'pg_stat_statements,pg_cron'" >> "$PG_DATA/postgresql.conf"
-    sed -i "/^cron.database_name/d" "$PG_DATA/postgresql.conf" || true
-    echo "cron.database_name = '$POSTGRES_DB'" >> "$PG_DATA/postgresql.conf"
-    sed -i "/^password_encryption/d" "$PG_DATA/postgresql.conf" || true
-    echo "password_encryption = scram-sha-256" >> "$PG_DATA/postgresql.conf"
-    chown postgres:postgres "$PG_DATA/postgresql.conf"
 fi
 
 log "Starting PostgreSQL 17 HA node in $NODE_ROLE mode..."

@@ -18,12 +18,14 @@ RUN apt-get update && apt-get install -y \
 COPY entrypoint.sh /usr/local/bin/entrypoint-custom.sh
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 
-# Initialize extensions script
+# Initialize extensions script (runs DURING initdb, before first server start)
 RUN mkdir -p /docker-entrypoint-initdb.d
-COPY init-extensions.sql /docker-entrypoint-initdb.d/init-extensions.sql
+COPY 00-configure-postgres.sh /docker-entrypoint-initdb.d/00-configure-postgres.sh
+COPY init-extensions.sql /docker-entrypoint-initdb.d/10-init-extensions.sql
 
 # Make executable
-RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh \
+    /docker-entrypoint-initdb.d/00-configure-postgres.sh
 
 # Set environment defaults
 ENV POSTGRES_DB=postgres
