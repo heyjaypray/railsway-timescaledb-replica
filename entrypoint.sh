@@ -31,6 +31,7 @@ load_balance_mode = on
 master_slave_sub_mode = 'stream'
 health_check_period = 10
 health_check_user = '$POSTGRES_USER'
+health_check_password = '$POSTGRES_PASSWORD'
 EOF
 
     echo "host all all 0.0.0.0/0 trust" > "$POOL_HBA"
@@ -82,8 +83,9 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
             sleep 5
         done
         
-        # Ensure correct password for future reconnections
-        echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$POSTGRES_PASSWORD replication_slot=replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
+        # Correct parameter name is 'primary_slot_name' (not replication_slot)
+        echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$POSTGRES_PASSWORD'" >> "$PG_DATA/postgresql.auto.conf"
+        echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
         chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
         log "Replica: Initial sync success."
     fi
