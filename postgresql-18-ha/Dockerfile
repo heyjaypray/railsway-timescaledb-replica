@@ -1,0 +1,38 @@
+FROM postgres:18-bookworm
+
+# Install PostgreSQL 18 extensions and useful tools
+# Note: Using the official PostgreSQL repository naming convention
+RUN apt-get update && apt-get install -y \
+    postgresql-18-postgis-3 \
+    postgresql-18-pgvector \
+    postgresql-18-cron \
+    postgresql-18-partman \
+    pgpool2 \
+    sudo \
+    bash \
+    iputils-ping \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy scripts
+COPY entrypoint.sh /usr/local/bin/entrypoint-custom.sh
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+
+# Initialize extensions script
+RUN mkdir -p /docker-entrypoint-initdb.d
+COPY init-extensions.sql /docker-entrypoint-initdb.d/init-extensions.sql
+
+# Make executable
+RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh
+
+# Set environment defaults
+ENV POSTGRES_DB=postgres
+ENV POSTGRES_USER=postgres
+ENV REPLICATION_USER=replicator
+ENV NODE_ROLE=PRIMARY
+
+# Healthcheck
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-custom.sh"]
