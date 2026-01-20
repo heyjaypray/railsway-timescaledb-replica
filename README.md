@@ -2,7 +2,7 @@
 
 ### _Enterprise-Grade Time-Series Cluster for Railway_
 
-A premium, production-ready TimescaleDB (Postgres 16) template featuring a centralized connection proxy, automatic Read/Write splitting, and high-availability (HA).
+A premium, production-ready TimescaleDB (Postgres 17) template featuring a centralized connection proxy, automatic Read/Write splitting, and high-availability (HA).
 
 ---
 

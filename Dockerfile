@@ -1,4 +1,4 @@
-FROM timescale/timescaledb:latest-pg16
+FROM timescale/timescaledb:latest-pg17
 
 # Install useful tools, replication dependencies and Pgpool-II
 RUN apk add --no-cache bash sudo iputils wget curl pgpool

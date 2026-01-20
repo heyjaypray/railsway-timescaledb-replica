@@ -1,5 +1,14 @@
 {
     "$schema": "https://railway.app/railway.schema.json",
+    "params": {
+        "POSTGRES_PASSWORD": {
+            "description": "The password for the PostgreSQL database and replication.",
+            "label": "Postgres Password",
+            "config": {
+                "length": 32
+            }
+        }
+    },
     "services": {
         "postgres-18-primary": {
             "source": {
@@ -7,8 +16,15 @@
             },
             "env": {
                 "NODE_ROLE": "PRIMARY",
-                "PGDATA": "/var/lib/postgresql/data/pgdata"
-            }
+                "PGDATA": "/var/lib/postgresql/data/pgdata",
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}"
+            },
+            "mounts": [
+                {
+                    "mountPath": "/var/lib/postgresql/data",
+                    "volume": "postgres-18-primary-data"
+                }
+            ]
         },
         "postgres-18-replica": {
             "source": {
@@ -17,8 +33,15 @@
             "env": {
                 "NODE_ROLE": "REPLICA",
                 "PGDATA": "/var/lib/postgresql/data/pgdata",
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
                 "PRIMARY_HOST": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}"
-            }
+            },
+            "mounts": [
+                {
+                    "mountPath": "/var/lib/postgresql/data",
+                    "volume": "postgres-18-replica-data"
+                }
+            ]
         },
         "postgres-18-proxy": {
             "source": {
@@ -26,6 +49,7 @@
             },
             "env": {
                 "NODE_ROLE": "PROXY",
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
                 "PRIMARY_HOST": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}",
                 "REPLICA_HOST": "${{postgres-18-replica.RAILWAY_PRIVATE_DOMAIN}}"
             }
