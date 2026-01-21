@@ -274,7 +274,7 @@ func setupTestTables(db *sql.DB) error {
 			pressure DOUBLE PRECISION
 		)`,
 		`CREATE TABLE loadtest_replication (
-			id UUID PRIMARY KEY,
+			id TEXT PRIMARY KEY,
 			write_time TIMESTAMPTZ NOT NULL,
 			data TEXT
 		)`,
