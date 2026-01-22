@@ -214,8 +214,8 @@ END \$\$;
 
 -- Configure for better replication
 ALTER SYSTEM SET wal_keep_size = '1GB';
-ALTER SYSTEM SET max_replication_slots = 4;
-ALTER SYSTEM SET max_wal_senders = 4;
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
 ALTER SYSTEM SET wal_sender_timeout = '60s';
 ALTER SYSTEM SET wal_level = 'replica';
 SELECT pg_reload_conf();
