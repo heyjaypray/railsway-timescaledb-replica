@@ -63,13 +63,13 @@ pcp_socket_dir = '/var/run/pgpool'
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
 backend_weight0 = 1
-backend_flag0 = 'ALLOW_TO_FAILOVER,ALWAYS_PRIMARY'
+backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_flag1 = 'ALLOW_TO_FAILOVER,DISALLOW_TO_FAILOVER_AS_PRIMARY'
+backend_flag1 = 'DISALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
 
 # Clustering mode

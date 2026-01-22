@@ -1,8 +1,20 @@
 #!/bin/bash
 # Unified Entrypoint for TimescaleDB HA (PRIMARY, REPLICA, PROXY)
 # Version 2.0 - Enhanced with Auto-Recovery and Resilience
+
+# Ensure output is unbuffered
+export PYTHONUNBUFFERED=1
+stdbuf -oL -eL true 2>/dev/null || true
+
+# Redirect stderr to stdout immediately
 exec 2>&1
+
+# Debug: Show we're starting
+echo "[DEBUG] Script starting, NODE_ROLE=${NODE_ROLE:-NOT_SET}"
+
+# Exit on error but with trap for debugging
 set -e
+trap 'echo "[DEBUG] Script exited at line $LINENO with status $?"' ERR
 
 # Logging colors
 GREEN='\033[0;32m'
@@ -69,13 +81,13 @@ pcp_socket_dir = '/var/run/pgpool'
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
 backend_weight0 = 1
-backend_flag0 = 'ALLOW_TO_FAILOVER,ALWAYS_PRIMARY'
+backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_flag1 = 'ALLOW_TO_FAILOVER,DISALLOW_TO_FAILOVER_AS_PRIMARY'
+backend_flag1 = 'DISALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
 
 # Clustering mode
