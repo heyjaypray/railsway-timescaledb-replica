@@ -61,6 +61,16 @@ ENV NODE_ROLE=PRIMARY
 ENV TZ=Asia/Bangkok
 ENV RECOVERY_CHECK_INTERVAL=30
 ENV MAX_RECOVERY_ATTEMPTS=3
+ENV REPLICA_ID=1
+ENV MAX_REPLICAS=2
+
+# Performance tuning (optimized for fast reads)
+ENV READ_WEIGHT_PRIMARY=0
+ENV READ_WEIGHT_REPLICA=1
+ENV DELAY_THRESHOLD_BYTES=1000000
+ENV ENABLE_QUERY_CACHE=on
+ENV QUERY_CACHE_SIZE=67108864
+ENV LOAD_BALANCE_ON_WRITE=transaction
 
 # Healthcheck with better intervals
 HEALTHCHECK --interval=15s --timeout=10s --retries=3 --start-period=30s CMD /usr/local/bin/healthcheck.sh

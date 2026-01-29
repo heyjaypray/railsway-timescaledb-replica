@@ -18,6 +18,14 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; }
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"
 
+# Performance tuning defaults (optimized for fast reads)
+READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"       # 0 = don't send reads to primary
+READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"       # Weight for each replica
+DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"  # 1MB - remove lagging replicas
+ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"        # Cache repeated queries
+QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"      # 64MB cache
+LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"  # Prevent stale reads after write
+
 log "Starting Pgpool-II Proxy v2.0 (Debian/Pgpool 4.7)..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB"
 
@@ -59,18 +67,34 @@ pcp_port = 9898
 unix_socket_directories = '/var/run/pgpool,/tmp'
 pcp_socket_dir = '/var/run/pgpool'
 
-# Backend nodes
+# Backend nodes (weights optimized for read-heavy workloads)
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
-backend_weight0 = 1
+backend_weight0 = $READ_WEIGHT_PRIMARY
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
-backend_weight1 = 1
+backend_weight1 = $READ_WEIGHT_REPLICA
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
+EOF
+
+# Add second replica if REPLICA_HOST_2 is set
+if [ -n "$REPLICA_HOST_2" ]; then
+    log "Adding second replica: $REPLICA_HOST_2"
+    cat >> "$PGPOOL_CONF" <<EOF
+
+backend_hostname2 = '$REPLICA_HOST_2'
+backend_port2 = 5432
+backend_weight2 = $READ_WEIGHT_REPLICA
+backend_flag2 = 'ALLOW_TO_FAILOVER'
+backend_data_directory2 = '/var/lib/postgresql/data'
+EOF
+fi
+
+cat >> "$PGPOOL_CONF" <<EOF
 
 # Clustering mode
 backend_clustering_mode = 'streaming_replication'
@@ -78,7 +102,7 @@ load_balance_mode = on
 
 # Session handling for TimescaleDB/pgx compatibility
 statement_level_load_balance = on
-disable_load_balance_on_write = 'off'
+disable_load_balance_on_write = '$LOAD_BALANCE_ON_WRITE'
 allow_sql_comments = on
 
 # Load balance preferences - force standby for reads
@@ -119,7 +143,7 @@ sr_check_period = 5
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
-delay_threshold = 10000000
+delay_threshold = $DELAY_THRESHOLD_BYTES
 
 # Logging
 log_destination = 'stderr'
@@ -140,8 +164,14 @@ child_max_connections = 0
 connection_life_time = 0
 client_idle_limit = 0
 
-# Memory cache (disabled for simplicity)
-memory_cache_enabled = off
+# Memory cache for faster repeated reads
+memory_cache_enabled = $ENABLE_QUERY_CACHE
+memqcache_method = 'shmem'
+memqcache_total_size = $QUERY_CACHE_SIZE
+memqcache_max_num_cache = 1000000
+memqcache_expire = 60
+memqcache_auto_cache_invalidation = on
+memqcache_maxcache = 409600
 
 # Watchdog (disabled - single proxy)
 use_watchdog = off
@@ -163,23 +193,40 @@ done
     log "Starting background node monitor..."
     sleep 60  # Wait for pgpool to fully start
     
+    # Determine max node index based on REPLICA_HOST_2
+    MAX_NODE=1
+    if [ -n "$REPLICA_HOST_2" ]; then
+        MAX_NODE=2
+    fi
+    
     while true; do
         sleep 60
         
-        # Check if replica is healthy but detached
+        # Check if replica 1 is healthy but detached
         if pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
-            # Check if replica is in Pgpool
             NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
             
             if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
-                log "Detected healthy replica is detached, attempting to attach..."
+                log "Detected healthy replica 1 is detached, attempting to attach..."
                 PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>&1 || true
+            fi
+        fi
+        
+        # Check if replica 2 is healthy but detached (if configured)
+        if [ -n "$REPLICA_HOST_2" ]; then
+            if pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
+                NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+                
+                if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
+                    log "Detected healthy replica 2 is detached, attempting to attach..."
+                    PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>&1 || true
+                fi
             fi
         fi
         
         # Log cluster status periodically
         log "Cluster status:"
-        for i in 0 1; do
+        for i in $(seq 0 $MAX_NODE); do
             STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
             echo "  Node $i: $STATUS"
         done

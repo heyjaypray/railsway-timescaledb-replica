@@ -5,22 +5,25 @@
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │   Application   │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Pgpool-II 4.7  │  ← Load Balancer & Connection Pool
-                    │     (PROXY)     │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-    ┌─────────▼─────────┐         ┌─────────▼─────────┐
-    │   TimescaleDB     │         │   TimescaleDB     │
-    │    (PRIMARY)      │◄────────│    (REPLICA)      │
-    │   Read/Write      │  Stream │    Read Only      │
-    └───────────────────┘   WAL   └───────────────────┘
+                         ┌─────────────────┐
+                         │   Application   │
+                         └────────┬────────┘
+                                  │
+                         ┌────────▼────────┐
+                         │  Pgpool-II 4.7  │  ← Load Balancer & Connection Pool
+                         │     (PROXY)     │
+                         └────────┬────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+┌───────▼───────┐         ┌───────▼───────┐         ┌───────▼───────┐
+│  TimescaleDB  │         │  TimescaleDB  │         │  TimescaleDB  │
+│   (PRIMARY)   │◄────────│  (REPLICA 1)  │         │  (REPLICA 2)  │
+│  Read/Write   │  Stream │   Read Only   │         │   Read Only   │
+└───────────────┘   WAL   └───────────────┘         └───────────────┘
+        │                                                   ▲
+        └───────────────────────────────────────────────────┘
+                              Stream WAL
 ```
 
 ## Features
@@ -57,12 +60,38 @@
 | `TS_TUNE_MEMORY`    | Memory for TimescaleDB tuning         | `2GB`        |
 | `TS_TUNE_CORES`     | CPU cores for TimescaleDB tuning      | `2`          |
 
-### Additional Variables for REPLICA/PROXY
+### Additional Variables for REPLICA
 
-| Variable       | Description                           |
-| -------------- | ------------------------------------- |
-| `PRIMARY_HOST` | Hostname of PRIMARY node              |
-| `REPLICA_HOST` | Hostname of REPLICA node (PROXY only) |
+| Variable       | Description                                      | Default |
+| -------------- | ------------------------------------------------ | ------- |
+| `PRIMARY_HOST` | Hostname of PRIMARY node                         | Required |
+| `REPLICA_ID`   | Unique ID for this replica (1, 2, etc.)          | `1`     |
+
+### Additional Variables for PROXY
+
+| Variable         | Description                           |
+| ---------------- | ------------------------------------- |
+| `PRIMARY_HOST`   | Hostname of PRIMARY node              |
+| `REPLICA_HOST`   | Hostname of REPLICA 1 node            |
+| `REPLICA_HOST_2` | Hostname of REPLICA 2 node (optional) |
+
+### Performance Tuning (PROXY)
+
+| Variable | Description | Default |
+| -------- | ----------- | ------- |
+| `READ_WEIGHT_PRIMARY` | Read weight for PRIMARY (0 = no reads) | `0` |
+| `READ_WEIGHT_REPLICA` | Read weight for each replica | `1` |
+| `DELAY_THRESHOLD_BYTES` | Max replication lag before removing replica from pool | `1000000` (1MB) |
+| `ENABLE_QUERY_CACHE` | Enable in-memory query cache | `on` |
+| `QUERY_CACHE_SIZE` | Query cache size in bytes | `67108864` (64MB) |
+| `LOAD_BALANCE_ON_WRITE` | Load balance behavior after writes: `off`, `transaction`, `trans_transaction`, `always` | `transaction` |
+
+**Tuning Tips:**
+
+- **Read-heavy workload**: Keep `READ_WEIGHT_PRIMARY=0` to offload PRIMARY for writes only
+- **Mixed workload**: Set `READ_WEIGHT_PRIMARY=1` to include PRIMARY in read pool
+- **Strict consistency**: Use `LOAD_BALANCE_ON_WRITE=transaction` to prevent stale reads after write
+- **Eventual consistency OK**: Use `LOAD_BALANCE_ON_WRITE=off` for maximum read throughput
 
 ### Recovery Settings (REPLICA)
 
@@ -83,18 +112,31 @@
    ```
 3. Add a volume mounted to `/var/lib/postgresql/data`
 
-### Step 2: Deploy REPLICA
+### Step 2: Deploy REPLICA 1
 
 1. Create another service from this repo
 2. Set environment variables:
    ```
    POSTGRES_PASSWORD=your_secure_password
    NODE_ROLE=REPLICA
+   REPLICA_ID=1
    PRIMARY_HOST=timescale-primary.railway.internal
    ```
 3. Add a volume mounted to `/var/lib/postgresql/data`
 
-### Step 3: Deploy PROXY
+### Step 3: Deploy REPLICA 2 (Optional)
+
+1. Create another service from this repo
+2. Set environment variables:
+   ```
+   POSTGRES_PASSWORD=your_secure_password
+   NODE_ROLE=REPLICA
+   REPLICA_ID=2
+   PRIMARY_HOST=timescale-primary.railway.internal
+   ```
+3. Add a volume mounted to `/var/lib/postgresql/data`
+
+### Step 4: Deploy PROXY
 
 **Option A: Using Dockerfile (Alpine + Pgpool 4.7 compiled)**
 
@@ -110,12 +152,21 @@ dockerfilePath=Dockerfile.proxy
 NODE_ROLE=PROXY
 ```
 
-Environment variables:
+Environment variables (single replica):
 
 ```
 POSTGRES_PASSWORD=your_secure_password
 PRIMARY_HOST=timescale-primary.railway.internal
-REPLICA_HOST=timescale-replica.railway.internal
+REPLICA_HOST=timescale-replica-1.railway.internal
+```
+
+Environment variables (two replicas):
+
+```
+POSTGRES_PASSWORD=your_secure_password
+PRIMARY_HOST=timescale-primary.railway.internal
+REPLICA_HOST=timescale-replica-1.railway.internal
+REPLICA_HOST_2=timescale-replica-2.railway.internal
 ```
 
 ## Connection Strings
@@ -182,10 +233,11 @@ SHOW pool_nodes;
 -- Check replication status (on PRIMARY)
 SELECT * FROM pg_stat_replication;
 
--- Check replication slots (on PRIMARY)
+-- Check replication slots (on PRIMARY) - shows all replica slots
 SELECT slot_name, active, restart_lsn,
        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
-FROM pg_replication_slots;
+FROM pg_replication_slots
+WHERE slot_name LIKE 'replica_slot_%';
 
 -- Check replication lag (on REPLICA)
 SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;
@@ -196,10 +248,12 @@ SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;
 ```bash
 # Show node info
 pcp_node_info -h localhost -p 9898 -U postgres -n 0  # PRIMARY
-pcp_node_info -h localhost -p 9898 -U postgres -n 1  # REPLICA
+pcp_node_info -h localhost -p 9898 -U postgres -n 1  # REPLICA 1
+pcp_node_info -h localhost -p 9898 -U postgres -n 2  # REPLICA 2 (if configured)
 
 # Manually attach node
-pcp_attach_node -h localhost -p 9898 -U postgres -n 1
+pcp_attach_node -h localhost -p 9898 -U postgres -n 1  # Attach REPLICA 1
+pcp_attach_node -h localhost -p 9898 -U postgres -n 2  # Attach REPLICA 2
 
 # Detach node
 pcp_detach_node -h localhost -p 9898 -U postgres -n 1

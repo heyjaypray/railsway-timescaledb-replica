@@ -32,6 +32,16 @@ POSTGRES_DB="${POSTGRES_DB:-postgres}"
 REPLICATION_USER="${REPLICATION_USER:-replicator}"
 RECOVERY_CHECK_INTERVAL="${RECOVERY_CHECK_INTERVAL:-30}"
 MAX_RECOVERY_ATTEMPTS="${MAX_RECOVERY_ATTEMPTS:-3}"
+REPLICA_ID="${REPLICA_ID:-1}"
+MAX_REPLICAS="${MAX_REPLICAS:-2}"
+
+# Performance tuning defaults (optimized for fast reads)
+READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"       # 0 = don't send reads to primary
+READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"       # Weight for each replica
+DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"  # 1MB - remove lagging replicas
+ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"        # Cache repeated queries
+QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"      # 64MB cache
+LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"  # Prevent stale reads after write
 
 log "Starting TimescaleDB HA Entrypoint v2.0..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER, ROLE=$NODE_ROLE"
@@ -77,18 +87,34 @@ pcp_port = 9898
 unix_socket_directories = '/var/run/pgpool,/tmp'
 pcp_socket_dir = '/var/run/pgpool'
 
-# Backend nodes
+# Backend nodes (weights optimized for read-heavy workloads)
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
-backend_weight0 = 1
+backend_weight0 = $READ_WEIGHT_PRIMARY
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
-backend_weight1 = 1
+backend_weight1 = $READ_WEIGHT_REPLICA
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
+EOF
+
+    # Add second replica if REPLICA_HOST_2 is set
+    if [ -n "$REPLICA_HOST_2" ]; then
+        log "Adding second replica: $REPLICA_HOST_2"
+        cat >> "$PGPOOL_CONF" <<EOF
+
+backend_hostname2 = '$REPLICA_HOST_2'
+backend_port2 = 5432
+backend_weight2 = $READ_WEIGHT_REPLICA
+backend_flag2 = 'ALLOW_TO_FAILOVER'
+backend_data_directory2 = '/var/lib/postgresql/data'
+EOF
+    fi
+
+    cat >> "$PGPOOL_CONF" <<EOF
 
 # Clustering mode
 backend_clustering_mode = 'streaming_replication'
@@ -96,7 +122,7 @@ load_balance_mode = on
 
 # Session handling for TimescaleDB/pgx compatibility
 statement_level_load_balance = on
-disable_load_balance_on_write = 'off'
+disable_load_balance_on_write = '$LOAD_BALANCE_ON_WRITE'
 allow_sql_comments = on
 
 # Load balance preferences - force standby for reads
@@ -137,7 +163,7 @@ sr_check_period = 5
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
-delay_threshold = 10000000
+delay_threshold = $DELAY_THRESHOLD_BYTES
 
 # Logging
 log_destination = 'stderr'
@@ -158,8 +184,14 @@ child_max_connections = 0
 connection_life_time = 0
 client_idle_limit = 0
 
-# Memory cache (disabled for simplicity)
-memory_cache_enabled = off
+# Memory cache for faster repeated reads
+memory_cache_enabled = $ENABLE_QUERY_CACHE
+memqcache_method = 'shmem'
+memqcache_total_size = $QUERY_CACHE_SIZE
+memqcache_max_num_cache = 1000000
+memqcache_expire = 60
+memqcache_auto_cache_invalidation = on
+memqcache_maxcache = 409600
 
 # Watchdog (disabled - single proxy)
 use_watchdog = off
@@ -213,18 +245,24 @@ BEGIN
     END IF;
 END \$\$;
 
--- Replication Slot (with auto-cleanup for stale slots)
+-- Replication Slots for multiple replicas (create slots 1 to MAX_REPLICAS)
 DO \$\$
+DECLARE
+    slot_name TEXT;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot') THEN
-        PERFORM pg_create_physical_replication_slot('replica_slot');
-    END IF;
+    FOR i IN 1..$MAX_REPLICAS LOOP
+        slot_name := 'replica_slot_' || i;
+        IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = slot_name) THEN
+            PERFORM pg_create_physical_replication_slot(slot_name);
+            RAISE NOTICE 'Created replication slot: %', slot_name;
+        END IF;
+    END LOOP;
 END \$\$;
 
--- Configure for better replication
+-- Configure for better replication (support multiple replicas)
 ALTER SYSTEM SET wal_keep_size = '1GB';
-ALTER SYSTEM SET max_replication_slots = 10;
-ALTER SYSTEM SET max_wal_senders = 10;
+ALTER SYSTEM SET max_replication_slots = GREATEST(10, $MAX_REPLICAS + 5);
+ALTER SYSTEM SET max_wal_senders = GREATEST(10, $MAX_REPLICAS + 5);
 ALTER SYSTEM SET wal_sender_timeout = '60s';
 ALTER SYSTEM SET wal_level = 'replica';
 SELECT pg_reload_conf();
@@ -292,13 +330,13 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         # Perform base backup with retries
         local attempts=0
         while [ $attempts -lt $MAX_RECOVERY_ATTEMPTS ]; do
-            log "Replica: Base backup attempt $((attempts+1))/$MAX_RECOVERY_ATTEMPTS..."
+            log "Replica: Base backup attempt $((attempts+1))/$MAX_RECOVERY_ATTEMPTS using slot 'replica_slot_${REPLICA_ID}'..."
             if PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup \
                 -h "$PRIMARY_HOST" \
                 -D "$PG_DATA" \
                 -U "$REPLICATION_USER" \
                 -v -R -P \
-                --slot=replica_slot \
+                --slot=replica_slot_${REPLICA_ID} \
                 --checkpoint=fast \
                 --wal-method=stream 2>&1; then
                 log "Replica: Base backup completed successfully."
@@ -320,13 +358,17 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         perform_full_sync
     fi
     
-    # Update postgresql.auto.conf
+    # Update postgresql.auto.conf with unique slot based on REPLICA_ID
     ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
+    SLOT_NAME="replica_slot_${REPLICA_ID}"
+    APP_NAME="replica${REPLICA_ID}"
+    
+    log "Replica: Using slot '$SLOT_NAME' with application name '$APP_NAME'"
     
     sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
     sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
-    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=replica1'" >> "$PG_DATA/postgresql.auto.conf"
-    echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
+    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=$APP_NAME'" >> "$PG_DATA/postgresql.auto.conf"
+    echo "primary_slot_name = '$SLOT_NAME'" >> "$PG_DATA/postgresql.auto.conf"
     
     # Ensure standby.signal exists
     touch "$PG_DATA/standby.signal"
