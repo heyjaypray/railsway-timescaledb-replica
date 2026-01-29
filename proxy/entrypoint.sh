@@ -54,6 +54,13 @@ echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
 
 log "Configuring Pgpool-II with enhanced failback..."
 
+# Determine if running in single-node mode (DR failover scenario)
+SINGLE_NODE_MODE="false"
+if [ -z "$REPLICA_HOST" ] || [ "$REPLICA_HOST" = "$PRIMARY_HOST" ]; then
+    SINGLE_NODE_MODE="true"
+    log "Running in SINGLE-NODE mode (DR/failover configuration)"
+fi
+
 cat > "$PGPOOL_CONF" <<EOF
 # Pgpool-II 4.7 Configuration for TimescaleDB HA
 # Enhanced with Auto-Failback and Better Recovery
@@ -70,9 +77,14 @@ pcp_socket_dir = '/var/run/pgpool'
 # Backend nodes (weights optimized for read-heavy workloads)
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
-backend_weight0 = $READ_WEIGHT_PRIMARY
+backend_weight0 = 1
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
+EOF
+
+# Only add replica backend if not in single-node mode
+if [ "$SINGLE_NODE_MODE" = "false" ]; then
+    cat >> "$PGPOOL_CONF" <<EOF
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
@@ -81,10 +93,10 @@ backend_flag1 = 'ALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
 EOF
 
-# Add second replica if REPLICA_HOST_2 is set
-if [ -n "$REPLICA_HOST_2" ]; then
-    log "Adding second replica: $REPLICA_HOST_2"
-    cat >> "$PGPOOL_CONF" <<EOF
+    # Add second replica if REPLICA_HOST_2 is set
+    if [ -n "$REPLICA_HOST_2" ]; then
+        log "Adding second replica: $REPLICA_HOST_2"
+        cat >> "$PGPOOL_CONF" <<EOF
 
 backend_hostname2 = '$REPLICA_HOST_2'
 backend_port2 = 5432
@@ -92,12 +104,32 @@ backend_weight2 = $READ_WEIGHT_REPLICA
 backend_flag2 = 'ALLOW_TO_FAILOVER'
 backend_data_directory2 = '/var/lib/postgresql/data'
 EOF
+    fi
 fi
 
 cat >> "$PGPOOL_CONF" <<EOF
 
 # Clustering mode
 backend_clustering_mode = 'streaming_replication'
+EOF
+
+# Configure load balancing based on mode
+if [ "$SINGLE_NODE_MODE" = "true" ]; then
+    log "Configuring single-node mode (no load balancing)"
+    cat >> "$PGPOOL_CONF" <<EOF
+load_balance_mode = off
+
+# Session handling
+statement_level_load_balance = off
+disable_load_balance_on_write = 'always'
+allow_sql_comments = on
+
+# No redirect preferences in single-node mode
+database_redirect_preference_list = ''
+app_name_redirect_preference_list = ''
+EOF
+else
+    cat >> "$PGPOOL_CONF" <<EOF
 load_balance_mode = on
 
 # Session handling for TimescaleDB/pgx compatibility
@@ -108,6 +140,10 @@ allow_sql_comments = on
 # Load balance preferences - force standby for reads
 database_redirect_preference_list = 'postgres:standby'
 app_name_redirect_preference_list = 'psql:standby,pgadmin:standby,dbeaver:standby'
+EOF
+fi
+
+cat >> "$PGPOOL_CONF" <<EOF
 
 # Allow all functions to be load balanced (empty = all allowed)
 black_function_list = ''
@@ -193,33 +229,39 @@ done
     log "Starting background node monitor..."
     sleep 60  # Wait for pgpool to fully start
     
-    # Determine max node index based on REPLICA_HOST_2
-    MAX_NODE=1
-    if [ -n "$REPLICA_HOST_2" ]; then
-        MAX_NODE=2
+    # Determine max node index based on configuration
+    MAX_NODE=0
+    if [ "$SINGLE_NODE_MODE" = "false" ]; then
+        MAX_NODE=1
+        if [ -n "$REPLICA_HOST_2" ]; then
+            MAX_NODE=2
+        fi
     fi
     
     while true; do
         sleep 60
         
-        # Check if replica 1 is healthy but detached
-        if pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
-            NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
-            
-            if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
-                log "Detected healthy replica 1 is detached, attempting to attach..."
-                PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>&1 || true
-            fi
-        fi
-        
-        # Check if replica 2 is healthy but detached (if configured)
-        if [ -n "$REPLICA_HOST_2" ]; then
-            if pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
-                NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+        # Skip replica monitoring in single-node mode
+        if [ "$SINGLE_NODE_MODE" = "false" ]; then
+            # Check if replica 1 is healthy but detached
+            if pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
+                NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
                 
                 if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
-                    log "Detected healthy replica 2 is detached, attempting to attach..."
-                    PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>&1 || true
+                    log "Detected healthy replica 1 is detached, attempting to attach..."
+                    PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>&1 || true
+                fi
+            fi
+            
+            # Check if replica 2 is healthy but detached (if configured)
+            if [ -n "$REPLICA_HOST_2" ]; then
+                if pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
+                    NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+                    
+                    if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
+                        log "Detected healthy replica 2 is detached, attempting to attach..."
+                        PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>&1 || true
+                    fi
                 fi
             fi
         fi
