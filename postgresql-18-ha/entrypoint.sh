@@ -214,6 +214,32 @@ EOF
     ) &
 fi
 
+# --- PROMOTION CHECK (For DR Failover) ---
+# Set PROMOTE=true to convert a replica to a standalone primary
+if [ "$PROMOTE" = "true" ] && [ "$NODE_ROLE" = "REPLICA" ]; then
+    log "╔════════════════════════════════════════════════════════════╗"
+    log "║  PROMOTION MODE ACTIVATED - Converting replica to primary  ║"
+    log "╚════════════════════════════════════════════════════════════╝"
+    
+    # Remove standby.signal to exit recovery mode
+    if [ -f "$PG_DATA/standby.signal" ]; then
+        log "Removing standby.signal..."
+        rm -f "$PG_DATA/standby.signal"
+    fi
+    
+    # Remove replication configuration
+    if [ -f "$PG_DATA/postgresql.auto.conf" ]; then
+        log "Removing replication configuration..."
+        sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+        sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+    fi
+    
+    # Change NODE_ROLE for logging purposes
+    NODE_ROLE="PROMOTED"
+    log "Replica has been promoted! Starting as standalone primary..."
+    log "⚠️  IMPORTANT: After failover is complete, update NODE_ROLE=PRIMARY and remove PROMOTE=true"
+fi
+
 # --- REPLICA SETUP ---
 if [ "$NODE_ROLE" = "REPLICA" ]; then
     SLOT_NAME="replica_slot_${REPLICA_ID}"
