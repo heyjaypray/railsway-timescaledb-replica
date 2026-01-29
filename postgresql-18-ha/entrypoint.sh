@@ -154,6 +154,15 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
 -- Sync main user password
 ALTER USER "$POSTGRES_USER" WITH PASSWORD '$ESCAPED_PWD';
 
+-- Ensure timbercloud_admin user exists (for backup compatibility)
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'timbercloud_admin') THEN
+        CREATE USER timbercloud_admin WITH SUPERUSER CREATEDB CREATEROLE LOGIN PASSWORD '$ESCAPED_PWD';
+        RAISE NOTICE 'Created user: timbercloud_admin';
+    END IF;
+END \$\$;
+
 -- Ensure replication user exists
 DO \$\$
 BEGIN
