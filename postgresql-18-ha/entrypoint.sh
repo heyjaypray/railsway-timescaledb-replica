@@ -15,6 +15,16 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"
 REPLICATION_USER="${REPLICATION_USER:-replicator}"
+REPLICA_ID="${REPLICA_ID:-1}"
+MAX_REPLICAS="${MAX_REPLICAS:-2}"
+
+# Performance tuning defaults (optimized for fast reads)
+READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"
+READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"
+DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"
+ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
+QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
+LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"
 
 log "Booting PostgreSQL 18 HA Entrypoint..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER"
@@ -24,8 +34,8 @@ log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER"
 # -------------------------------------------------------------------------
 if [ "$NODE_ROLE" = "PROXY" ]; then
     log "Configuring Pgpool-II Proxy..."
-    mkdir -p /var/run/pgpool
-    chown -R postgres:postgres /var/run/pgpool || true
+    mkdir -p /var/run/pgpool /var/log/pgpool
+    chown -R postgres:postgres /var/run/pgpool /var/log/pgpool || true
 
     PGPOOL_CONF="/etc/pgpool.conf"
     
@@ -36,23 +46,39 @@ if [ "$NODE_ROLE" = "PROXY" ]; then
 listen_addresses = '*'
 port = 5432
 pcp_port = 9898
+
+# Backend nodes (weights optimized for read-heavy workloads)
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
-backend_weight0 = 1
+backend_weight0 = $READ_WEIGHT_PRIMARY
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
-backend_weight1 = 1
+backend_weight1 = $READ_WEIGHT_REPLICA
 backend_flag1 = 'ALLOW_TO_FAILOVER'
+EOF
+
+    # Add second replica if REPLICA_HOST_2 is set
+    if [ -n "$REPLICA_HOST_2" ]; then
+        log "Adding second replica: $REPLICA_HOST_2"
+        cat >> "$PGPOOL_CONF" <<EOF
+
+backend_hostname2 = '$REPLICA_HOST_2'
+backend_port2 = 5432
+backend_weight2 = $READ_WEIGHT_REPLICA
+backend_flag2 = 'ALLOW_TO_FAILOVER'
+EOF
+    fi
+
+    cat >> "$PGPOOL_CONF" <<EOF
 
 backend_clustering_mode = 'streaming_replication'
 load_balance_mode = on
-master_slave_sub_mode = 'stream'
 
 # Session handling for pgx/Go compatibility
 statement_level_load_balance = on
-disable_load_balance_on_write = 'transaction'
+disable_load_balance_on_write = '$LOAD_BALANCE_ON_WRITE'
 allow_sql_comments = on
 
 # Authentication: Pass-through
@@ -60,20 +86,22 @@ enable_pool_hba = off
 pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
-# Health Check & SR Check (Explicit database to fix status -2)
-health_check_period = 10
-health_check_timeout = 30
+# Health Check & SR Check
+health_check_period = 5
+health_check_timeout = 20
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
-health_check_max_retries = 3
-health_check_retry_delay = 1
+health_check_max_retries = 5
+health_check_retry_delay = 2
 auto_failback = on
+auto_failback_interval = 30
 
-sr_check_period = 10
+sr_check_period = 5
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
+delay_threshold = $DELAY_THRESHOLD_BYTES
 
 # Logging
 log_min_messages = warning
@@ -84,6 +112,15 @@ max_pool = 4
 child_life_time = 300
 connection_life_time = 0
 client_idle_limit = 0
+
+# Memory cache for faster repeated reads
+memory_cache_enabled = $ENABLE_QUERY_CACHE
+memqcache_method = 'shmem'
+memqcache_total_size = $QUERY_CACHE_SIZE
+memqcache_max_num_cache = 1000000
+memqcache_expire = 60
+memqcache_auto_cache_invalidation = on
+memqcache_maxcache = 409600
 EOF
 
     log "Waiting for Primary ($PRIMARY_HOST)..."
@@ -127,9 +164,24 @@ BEGIN
     END IF;
 END \$\$;
 
--- Replication Slot
-SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
-WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+-- Replication Slots for multiple replicas
+DO \$\$
+DECLARE
+    slot TEXT;
+BEGIN
+    FOR i IN 1..$MAX_REPLICAS LOOP
+        slot := 'replica_slot_' || i;
+        IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = slot) THEN
+            PERFORM pg_create_physical_replication_slot(slot);
+            RAISE NOTICE 'Created replication slot: %', slot;
+        END IF;
+    END LOOP;
+END \$\$;
+
+-- Configure for better replication
+ALTER SYSTEM SET wal_keep_size = '1GB';
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
 
 -- pg_cron extension (requires shared_preload_libraries, only works after real server start)
 CREATE EXTENSION IF NOT EXISTS "pg_cron";
@@ -164,26 +216,33 @@ fi
 
 # --- REPLICA SETUP ---
 if [ "$NODE_ROLE" = "REPLICA" ]; then
-    log "Replica: Initializing sync logic..."
+    SLOT_NAME="replica_slot_${REPLICA_ID}"
+    APP_NAME="replica${REPLICA_ID}"
+    
+    log "Replica $REPLICA_ID: Initializing sync logic using slot '$SLOT_NAME'..."
+    
     if [ ! -s "$PG_DATA/PG_VERSION" ]; then
-        log "Replica: Cloning data from $PRIMARY_HOST..."
+        log "Replica $REPLICA_ID: Cloning data from $PRIMARY_HOST..."
         until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
         rm -rf "$PG_DATA"/*
-        until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$PRIMARY_HOST" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=replica_slot; do
+        until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$PRIMARY_HOST" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=$SLOT_NAME --checkpoint=fast; do
             warn "Waiting for primary to be ready for backup..."
-            sleep 5
+            sleep 10
         done
-        log "Replica: Sync complete."
+        log "Replica $REPLICA_ID: Sync complete."
     fi
     
-    # Update postgresql.auto.conf (append/update)
+    # Update postgresql.auto.conf with unique slot based on REPLICA_ID
     ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
     
     sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
     sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
-    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD'" >> "$PG_DATA/postgresql.auto.conf"
-    echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
-    chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
+    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=$APP_NAME'" >> "$PG_DATA/postgresql.auto.conf"
+    echo "primary_slot_name = '$SLOT_NAME'" >> "$PG_DATA/postgresql.auto.conf"
+    
+    # Ensure standby.signal exists
+    touch "$PG_DATA/standby.signal"
+    chown postgres:postgres "$PG_DATA/postgresql.auto.conf" "$PG_DATA/standby.signal"
 fi
 
 log "Starting PostgreSQL 18 HA node in $NODE_ROLE mode..."
