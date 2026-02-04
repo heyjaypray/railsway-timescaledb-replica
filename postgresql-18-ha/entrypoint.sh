@@ -27,6 +27,13 @@ ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
 LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"
 
+# Health check tuning (optimized for cross-region replicas)
+HEALTH_CHECK_PERIOD="${HEALTH_CHECK_PERIOD:-15}"
+HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-30}"
+HEALTH_CHECK_MAX_RETRIES="${HEALTH_CHECK_MAX_RETRIES:-5}"
+HEALTH_CHECK_RETRY_DELAY="${HEALTH_CHECK_RETRY_DELAY:-5}"
+AUTO_FAILBACK_INTERVAL="${AUTO_FAILBACK_INTERVAL:-30}"
+
 log "Booting PostgreSQL 18 HA Entrypoint..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER"
 
@@ -88,15 +95,15 @@ pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
 # Health Check & SR Check
-health_check_period = 5
-health_check_timeout = 20
+health_check_period = $HEALTH_CHECK_PERIOD
+health_check_timeout = $HEALTH_CHECK_TIMEOUT
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
-health_check_max_retries = 5
-health_check_retry_delay = 2
+health_check_max_retries = $HEALTH_CHECK_MAX_RETRIES
+health_check_retry_delay = $HEALTH_CHECK_RETRY_DELAY
 auto_failback = on
-auto_failback_interval = 30
+auto_failback_interval = $AUTO_FAILBACK_INTERVAL
 
 sr_check_period = 5
 sr_check_user = '$POSTGRES_USER'
