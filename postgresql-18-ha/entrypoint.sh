@@ -21,7 +21,7 @@ MAX_REPLICAS="${MAX_REPLICAS:-2}"
 # Performance tuning defaults (optimized for fast reads)
 READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"
 READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"
-READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-0}"
+READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-$READ_WEIGHT_REPLICA}"
 DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"
 ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
@@ -30,7 +30,7 @@ LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"
 # Health check tuning (optimized for cross-region replicas)
 HEALTH_CHECK_PERIOD="${HEALTH_CHECK_PERIOD:-15}"
 HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-30}"
-HEALTH_CHECK_MAX_RETRIES="${HEALTH_CHECK_MAX_RETRIES:-5}"
+HEALTH_CHECK_MAX_RETRIES="${HEALTH_CHECK_MAX_RETRIES:-10}"
 HEALTH_CHECK_RETRY_DELAY="${HEALTH_CHECK_RETRY_DELAY:-5}"
 AUTO_FAILBACK_INTERVAL="${AUTO_FAILBACK_INTERVAL:-30}"
 
@@ -94,7 +94,10 @@ enable_pool_hba = off
 pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
-# Health Check & SR Check
+# Health Check - Tolerant for Railway cross-region networking
+# Railway internal DNS has transient latency spikes between regions.
+# With failover_on_backend_error=off, health checks are the only way
+# nodes get detached. Generous retries prevent false detachments.
 health_check_period = $HEALTH_CHECK_PERIOD
 health_check_timeout = $HEALTH_CHECK_TIMEOUT
 health_check_user = '$POSTGRES_USER'
@@ -102,16 +105,26 @@ health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
 health_check_max_retries = $HEALTH_CHECK_MAX_RETRIES
 health_check_retry_delay = $HEALTH_CHECK_RETRY_DELAY
-auto_failback = on
-auto_failback_interval = $AUTO_FAILBACK_INTERVAL
+connect_timeout = 20000
 
-sr_check_period = 5
+# Auto failback when replica comes back online
+auto_failback = on
+auto_failback_interval = 10
+
+# Failover behavior - CRITICAL: defaults are on, which instantly
+# detaches a node on ANY connection error. Must be off.
+failover_on_backend_error = off
+failover_on_backend_shutdown = off
+detach_false_primary = off
+
+# Streaming Replication Check - Relaxed to avoid false positives
+sr_check_period = 15
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
 delay_threshold = $DELAY_THRESHOLD_BYTES
 
-# Logging
+# Logging (use warning in production, info for debugging)
 log_min_messages = warning
 
 # Connection pooling
@@ -120,6 +133,14 @@ max_pool = 4
 child_life_time = 300
 connection_life_time = 0
 client_idle_limit = 0
+
+# PCP for node management
+pcp_listen_addresses = '*'
+pcp_socket_dir = '/var/run/pgpool'
+
+# PID and log files
+pid_file_name = '/var/run/pgpool/pgpool.pid'
+logdir = '/var/log/pgpool'
 
 # Memory cache for faster repeated reads
 memory_cache_enabled = $ENABLE_QUERY_CACHE
@@ -131,11 +152,97 @@ memqcache_auto_cache_invalidation = on
 memqcache_maxcache = 409600
 EOF
 
+    # Create PCP auth file so pcp_attach_node works
+    PCP_CONF="/etc/pgpool/pcp.conf"
+    mkdir -p /etc/pgpool
+    PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_USER}${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
+    echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
+
+    # Wait for Primary
     log "Waiting for Primary ($PRIMARY_HOST)..."
-    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
-    
+    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 3; done
+    log "Primary is ready."
+
+    # Wait for Replica(s) so PgPool doesn't detach them on first health check
+    log "Waiting for Replica ($REPLICA_HOST)..."
+    REPLICA_WAIT=0
+    until pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do
+        REPLICA_WAIT=$((REPLICA_WAIT+1))
+        if [ $REPLICA_WAIT -ge 60 ]; then
+            warn "Replica 1 not ready after 60 attempts, starting anyway (auto_failback will recover)"
+            break
+        fi
+        sleep 3
+    done
+
+    if [ -n "$REPLICA_HOST_2" ]; then
+        log "Waiting for Replica 2 ($REPLICA_HOST_2)..."
+        REPLICA_WAIT=0
+        until pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do
+            REPLICA_WAIT=$((REPLICA_WAIT+1))
+            if [ $REPLICA_WAIT -ge 60 ]; then
+                warn "Replica 2 not ready after 60 attempts, starting anyway (auto_failback will recover)"
+                break
+            fi
+            sleep 3
+        done
+    fi
+
+    # Background node monitor: re-attaches detached but healthy nodes
+    (
+        set +e
+        sleep 30  # Wait for pgpool to fully start
+        log "Background node monitor started (every 20s)."
+
+        # Determine max node index
+        MAX_NODE=1
+        [ -n "$REPLICA_HOST_2" ] && MAX_NODE=2
+
+        # Hostname lookup by node index
+        NODE_HOST_1="$REPLICA_HOST"
+        NODE_HOST_2="${REPLICA_HOST_2:-}"
+
+        CYCLE=0
+        while true; do
+            sleep 20
+            CYCLE=$((CYCLE+1))
+
+            for NODE_ID in $(seq 1 $MAX_NODE); do
+                eval "HOST=\$NODE_HOST_${NODE_ID}"
+                [ -z "$HOST" ] && continue
+
+                if pg_isready -h "$HOST" -p 5432 -U "$POSTGRES_USER" -t 5 > /dev/null 2>&1; then
+                    NODE_INFO=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>/dev/null || echo "")
+                    NODE_STATUS=$(echo "$NODE_INFO" | cut -d' ' -f3)
+
+                    if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
+                        log "Node $NODE_ID ($HOST) is alive but PgPool shows status=$NODE_STATUS. Re-attaching..."
+                        RESULT=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>&1)
+                        RC=$?
+                        if [ $RC -eq 0 ]; then
+                            log "Successfully re-attached node $NODE_ID ($HOST)"
+                        else
+                            warn "Failed to re-attach node $NODE_ID: rc=$RC $RESULT"
+                        fi
+                    fi
+                else
+                    [ $((CYCLE % 6)) -eq 0 ] && warn "Node $NODE_ID ($HOST) unreachable"
+                fi
+            done
+
+            # Log cluster status every 6th cycle (~2 min)
+            if [ $((CYCLE % 6)) -eq 0 ]; then
+                log "Cluster status:"
+                for i in $(seq 0 $MAX_NODE); do
+                    INFO=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
+                    echo "  Node $i: $INFO"
+                done
+            fi
+        done
+    ) &
+
     log "Launching Pgpool-II..."
-    exec pgpool -n -f "$PGPOOL_CONF" 2>&1
+    exec pgpool -n -f "$PGPOOL_CONF" -F "$PCP_CONF" 2>&1
 fi
 
 # -------------------------------------------------------------------------
