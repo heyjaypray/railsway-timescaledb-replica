@@ -155,27 +155,29 @@ enable_pool_hba = off
 pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
-# Health Check - More aggressive for Railway environment
-health_check_period = 5
-health_check_timeout = 20
+# Health Check - Tolerant for Railway cross-region networking
+# Railway internal DNS has transient latency spikes between regions.
+# Aggressive checks cause false detachments that never recover.
+health_check_period = 10
+health_check_timeout = 30
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
-health_check_max_retries = 5
-health_check_retry_delay = 2
-connect_timeout = 10000
+health_check_max_retries = 10
+health_check_retry_delay = 5
+connect_timeout = 20000
 
 # Auto failback when replica comes back online
 auto_failback = on
-auto_failback_interval = 30
+auto_failback_interval = 10
 
-# Failover behavior - Less aggressive to avoid false positives
+# Failover behavior - Prevent false detachments
 failover_on_backend_error = off
 failover_on_backend_shutdown = off
-detach_false_primary = on
+detach_false_primary = off
 
-# Streaming Replication Check
-sr_check_period = 5
+# Streaming Replication Check - Relaxed to avoid false positives
+sr_check_period = 15
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
@@ -223,11 +225,12 @@ until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1
     sleep 5
 done
 
-# Background node monitor for manual re-attach if auto_failback fails
+# Background node monitor for re-attach if auto_failback fails
+# Runs every 20s and explicitly logs attach success/failure
 (
     set +e
     log "Starting background node monitor..."
-    sleep 60  # Wait for pgpool to fully start
+    sleep 30  # Wait for pgpool to fully start
     
     # Determine max node index based on configuration
     MAX_NODE=0
@@ -238,40 +241,57 @@ done
         fi
     fi
     
+    # Build hostname array for readable logging
+    declare -A NODE_HOSTS
+    NODE_HOSTS[0]="$PRIMARY_HOST"
+    [ -n "$REPLICA_HOST" ] && NODE_HOSTS[1]="$REPLICA_HOST"
+    [ -n "$REPLICA_HOST_2" ] && NODE_HOSTS[2]="$REPLICA_HOST_2"
+    
+    CYCLE=0
+    
     while true; do
-        sleep 60
+        sleep 20
+        CYCLE=$((CYCLE+1))
         
         # Skip replica monitoring in single-node mode
         if [ "$SINGLE_NODE_MODE" = "false" ]; then
-            # Check if replica 1 is healthy but detached
-            if pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
-                NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+            # Check each standby node (1..MAX_NODE)
+            for NODE_ID in $(seq 1 $MAX_NODE); do
+                HOST="${NODE_HOSTS[$NODE_ID]}"
+                [ -z "$HOST" ] && continue
                 
-                if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
-                    log "Detected healthy replica 1 is detached, attempting to attach..."
-                    PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>&1 || true
-                fi
-            fi
-            
-            # Check if replica 2 is healthy but detached (if configured)
-            if [ -n "$REPLICA_HOST_2" ]; then
-                if pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
-                    NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+                # Check if the backend PostgreSQL is reachable
+                if pg_isready -h "$HOST" -p 5432 -U "$POSTGRES_USER" -t 5 > /dev/null 2>&1; then
+                    # Get PgPool's view of this node
+                    NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>/dev/null | cut -d' ' -f3 || echo "unknown")
                     
                     if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
-                        log "Detected healthy replica 2 is detached, attempting to attach..."
-                        PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>&1 || true
+                        log "Node $NODE_ID ($HOST) is healthy at PG level but PgPool status=$NODE_STATUS. Re-attaching..."
+                        ATTACH_RESULT=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>&1)
+                        ATTACH_RC=$?
+                        if [ $ATTACH_RC -eq 0 ]; then
+                            log "Successfully re-attached node $NODE_ID ($HOST)"
+                        else
+                            warn "Failed to re-attach node $NODE_ID ($HOST): rc=$ATTACH_RC output=$ATTACH_RESULT"
+                        fi
+                    fi
+                else
+                    # Only log unreachable nodes every 3rd cycle to reduce noise
+                    if [ $((CYCLE % 3)) -eq 0 ]; then
+                        warn "Node $NODE_ID ($HOST) is unreachable at PG level, skipping attach"
                     fi
                 fi
-            fi
+            done
         fi
         
-        # Log cluster status periodically
-        log "Cluster status:"
-        for i in $(seq 0 $MAX_NODE); do
-            STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
-            echo "  Node $i: $STATUS"
-        done
+        # Log cluster status every 6th cycle (~2 minutes)
+        if [ $((CYCLE % 6)) -eq 0 ]; then
+            log "Cluster status (cycle $CYCLE):"
+            for i in $(seq 0 $MAX_NODE); do
+                STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
+                echo "  Node $i (${NODE_HOSTS[$i]:-unknown}): $STATUS"
+            done
+        fi
     done
 ) &
 

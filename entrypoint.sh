@@ -139,27 +139,29 @@ enable_pool_hba = off
 pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
-# Health Check - More aggressive recovery
-health_check_period = 5
-health_check_timeout = 20
+# Health Check - Tolerant for Railway cross-region networking
+# Railway internal DNS has transient latency spikes between regions.
+# Aggressive checks cause false detachments that never recover.
+health_check_period = 10
+health_check_timeout = 30
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
-health_check_max_retries = 5
-health_check_retry_delay = 2
-connect_timeout = 10000
+health_check_max_retries = 10
+health_check_retry_delay = 5
+connect_timeout = 20000
 
 # Auto failback when replica comes back online
 auto_failback = on
-auto_failback_interval = 30
+auto_failback_interval = 10
 
-# Failover behavior
+# Failover behavior - Prevent false detachments
 failover_on_backend_error = off
 failover_on_backend_shutdown = off
-detach_false_primary = on
+detach_false_primary = off
 
-# Streaming Replication Check
-sr_check_period = 5
+# Streaming Replication Check - Relaxed to avoid false positives
+sr_check_period = 15
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
