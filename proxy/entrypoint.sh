@@ -49,7 +49,7 @@ PCP_CONF="/etc/pgpool2/pcp.conf"
 ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
 
 # Create PCP password file for attach node commands
-PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_USER}${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
+PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
 echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
 
 log "Configuring Pgpool-II with enhanced failback..."

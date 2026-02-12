@@ -155,7 +155,7 @@ EOF
     # Create PCP auth file so pcp_attach_node works
     PCP_CONF="/etc/pgpool/pcp.conf"
     mkdir -p /etc/pgpool
-    PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_USER}${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
+    PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
     echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
 
     # Wait for Primary
