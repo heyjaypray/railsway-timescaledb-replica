@@ -40,9 +40,16 @@ PCP_CONF="/etc/pgpool2/pcp.conf"
 # Escape single quotes in password
 ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
 
-# Create PCP password file for attach node commands
+# Create PCP auth file (server-side: pgpool verifies against this hash)
 PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
 echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
+
+# Create .pcppass file (client-side: pcp_node_info/pcp_attach_node read from this)
+PCPPASS_FILE="/root/.pcppass"
+ESCAPED_PCP_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed 's/\\/\\\\/g; s/:/\\:/g')
+echo "localhost:9898:${POSTGRES_USER}:${ESCAPED_PCP_PASS}" > "$PCPPASS_FILE"
+chmod 0600 "$PCPPASS_FILE"
+export PCPPASSFILE="$PCPPASS_FILE"
 
 log "Configuring Pgpool-II with enhanced failback..."
 
@@ -174,11 +181,11 @@ done
         
         # Check replica 1
         if pg_isready -h "$REPLICA_HOST" -p 5432 -U "$POSTGRES_USER" -t 5 > /dev/null 2>&1; then
-            NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+            NODE_STATUS=$(pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -w -n 1 2>/dev/null | cut -d' ' -f3 || echo "unknown")
             
             if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
                 log "Node 1 ($REPLICA_HOST) is healthy at PG level but PgPool status=$NODE_STATUS. Re-attaching..."
-                ATTACH_RESULT=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 1 2>&1)
+                ATTACH_RESULT=$(pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -w -n 1 2>&1)
                 ATTACH_RC=$?
                 if [ $ATTACH_RC -eq 0 ]; then
                     log "Successfully re-attached node 1 ($REPLICA_HOST)"
@@ -193,11 +200,11 @@ done
         # Check replica 2 if configured
         if [ -n "$REPLICA_HOST_2" ]; then
             if pg_isready -h "$REPLICA_HOST_2" -p 5432 -U "$POSTGRES_USER" -t 5 > /dev/null 2>&1; then
-                NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+                NODE_STATUS=$(pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -w -n 2 2>/dev/null | cut -d' ' -f3 || echo "unknown")
                 
                 if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
                     log "Node 2 ($REPLICA_HOST_2) is healthy at PG level but PgPool status=$NODE_STATUS. Re-attaching..."
-                    ATTACH_RESULT=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n 2 2>&1)
+                    ATTACH_RESULT=$(pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -w -n 2 2>&1)
                     ATTACH_RC=$?
                     if [ $ATTACH_RC -eq 0 ]; then
                         log "Successfully re-attached node 2 ($REPLICA_HOST_2)"
@@ -216,7 +223,7 @@ done
             MAX_NODE=1
             [ -n "$REPLICA_HOST_2" ] && MAX_NODE=2
             for i in $(seq 0 $MAX_NODE); do
-                STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
+                STATUS=$(pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -w -n $i 2>/dev/null || echo "error")
                 echo "  Node $i: $STATUS"
             done
         fi

@@ -48,9 +48,16 @@ PCP_CONF="/etc/pgpool2/pcp.conf"
 # Escape single quotes in password
 ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
 
-# Create PCP password file for attach node commands
+# Create PCP auth file (server-side: pgpool verifies against this hash)
 PCP_PASSWORD_HASH=$(echo -n "${POSTGRES_PASSWORD}" | md5sum | cut -d' ' -f1)
 echo "${POSTGRES_USER}:${PCP_PASSWORD_HASH}" > "$PCP_CONF"
+
+# Create .pcppass file (client-side: pcp_node_info/pcp_attach_node read from this)
+PCPPASS_FILE="/root/.pcppass"
+ESCAPED_PCP_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed 's/\\/\\\\/g; s/:/\\:/g')
+echo "localhost:9898:${POSTGRES_USER}:${ESCAPED_PCP_PASS}" > "$PCPPASS_FILE"
+chmod 0600 "$PCPPASS_FILE"
+export PCPPASSFILE="$PCPPASS_FILE"
 
 log "Configuring Pgpool-II with enhanced failback..."
 
@@ -263,11 +270,11 @@ done
                 # Check if the backend PostgreSQL is reachable
                 if pg_isready -h "$HOST" -p 5432 -U "$POSTGRES_USER" -t 5 > /dev/null 2>&1; then
                     # Get PgPool's view of this node
-                    NODE_STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+                    NODE_STATUS=$(pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -w -n $NODE_ID 2>/dev/null | cut -d' ' -f3 || echo "unknown")
                     
                     if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
                         log "Node $NODE_ID ($HOST) is healthy at PG level but PgPool status=$NODE_STATUS. Re-attaching..."
-                        ATTACH_RESULT=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -n $NODE_ID 2>&1)
+                        ATTACH_RESULT=$(pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -w -n $NODE_ID 2>&1)
                         ATTACH_RC=$?
                         if [ $ATTACH_RC -eq 0 ]; then
                             log "Successfully re-attached node $NODE_ID ($HOST)"
@@ -288,7 +295,7 @@ done
         if [ $((CYCLE % 6)) -eq 0 ]; then
             log "Cluster status (cycle $CYCLE):"
             for i in $(seq 0 $MAX_NODE); do
-                STATUS=$(PGPOOL_PCP_PASSWORD="$POSTGRES_PASSWORD" pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -n $i 2>/dev/null || echo "error")
+                STATUS=$(pcp_node_info -h localhost -p 9898 -U "$POSTGRES_USER" -w -n $i 2>/dev/null || echo "error")
                 echo "  Node $i (${NODE_HOSTS[$i]:-unknown}): $STATUS"
             done
         fi
