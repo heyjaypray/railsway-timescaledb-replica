@@ -15,7 +15,7 @@ if ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; then
 fi
 
 # Check if at least primary is available
-PRIMARY_STATUS=$(PGPOOL_PCP_PASSWORD="${POSTGRES_PASSWORD}" pcp_node_info -h localhost -p 9898 -U "${POSTGRES_USER:-postgres}" -n 0 2>/dev/null | cut -d' ' -f3 || echo "unknown")
+PRIMARY_STATUS=$(pcp_node_info -h localhost -p 9898 -U "${POSTGRES_USER:-postgres}" -w -n 0 2>/dev/null | cut -d' ' -f3 || echo "unknown")
 
 if [ "$PRIMARY_STATUS" = "3" ] || [ "$PRIMARY_STATUS" = "down" ]; then
     echo "Primary node is down"
