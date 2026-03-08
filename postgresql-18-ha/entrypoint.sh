@@ -127,9 +127,9 @@ delay_threshold = $DELAY_THRESHOLD_BYTES
 # Logging (use warning in production, info for debugging)
 log_min_messages = warning
 
-# Connection pooling
-num_init_children = 32
-max_pool = 4
+# Connection pooling (tunable via env vars)
+num_init_children = ${NUM_INIT_CHILDREN:-128}
+max_pool = ${MAX_POOL:-4}
 child_life_time = 300
 connection_life_time = 0
 client_idle_limit = 0
