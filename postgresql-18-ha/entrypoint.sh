@@ -417,4 +417,4 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
 fi
 
 log "Starting PostgreSQL 18 HA node in $NODE_ROLE mode..."
-exec docker-entrypoint.sh postgres -c logging_collector=off 2>&1
+exec docker-entrypoint.sh postgres -c logging_collector=off -c max_connections=300 2>&1
