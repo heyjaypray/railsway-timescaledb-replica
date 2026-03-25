@@ -25,7 +25,7 @@ READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-$READ_WEIGHT_REPLICA}"
 DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"
 ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
-LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"
+LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-dml_adaptive}"
 
 # Health check tuning (optimized for cross-region replicas)
 HEALTH_CHECK_PERIOD="${HEALTH_CHECK_PERIOD:-15}"
@@ -89,6 +89,10 @@ statement_level_load_balance = on
 disable_load_balance_on_write = '$LOAD_BALANCE_ON_WRITE'
 allow_sql_comments = on
 
+# Knex/Strapi uses BEGIN/COMMIT for read queries too -
+# ensure read-only transactions still get load-balanced to replicas
+read_only_function_list = ''
+
 # Authentication: Pass-through
 enable_pool_hba = off
 pool_passwd = ''
@@ -127,12 +131,21 @@ delay_threshold = $DELAY_THRESHOLD_BYTES
 # Logging (use warning in production, info for debugging)
 log_min_messages = warning
 
+# Temporarily enable to verify load balancing is routing to replicas
+# Shows which backend node each query is sent to
+# Set to off after verification
+log_per_node_statement = ${LOG_PER_NODE_STATEMENT:-off}
+
 # Connection pooling (tunable via env vars)
 num_init_children = ${NUM_INIT_CHILDREN:-70}
 max_pool = ${MAX_POOL:-4}
 child_life_time = 0
 connection_life_time = 0
 client_idle_limit = 0
+
+# Fix DISCARD ALL errors with Knex/Strapi transaction handling
+# Default reset_query_list includes DISCARD ALL which fails inside transactions
+reset_query_list = 'RESET ALL; SET SESSION AUTHORIZATION DEFAULT'
 
 # PCP for node management
 pcp_listen_addresses = '*'
