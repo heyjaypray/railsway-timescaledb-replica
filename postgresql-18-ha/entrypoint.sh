@@ -128,7 +128,7 @@ delay_threshold = $DELAY_THRESHOLD_BYTES
 log_min_messages = warning
 
 # Connection pooling (tunable via env vars)
-num_init_children = ${NUM_INIT_CHILDREN:-128}
+num_init_children = ${NUM_INIT_CHILDREN:-70}
 max_pool = ${MAX_POOL:-4}
 child_life_time = 0
 connection_life_time = 0
@@ -310,6 +310,7 @@ BEGIN
 END \$\$;
 
 -- Configure for better replication
+ALTER SYSTEM SET max_connections = 300;
 ALTER SYSTEM SET wal_keep_size = '1GB';
 ALTER SYSTEM SET max_replication_slots = 10;
 ALTER SYSTEM SET max_wal_senders = 10;

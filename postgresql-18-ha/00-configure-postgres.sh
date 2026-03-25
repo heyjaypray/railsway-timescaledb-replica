@@ -4,6 +4,7 @@
 
 # Append to postgresql.conf for pg_cron support and replication
 cat >> "$PGDATA/postgresql.conf" <<EOF
+max_connections = 300
 shared_preload_libraries = 'pg_stat_statements,pg_cron'
 cron.database_name = '${POSTGRES_DB:-postgres}'
 password_encryption = scram-sha-256
