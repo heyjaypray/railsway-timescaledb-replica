@@ -130,7 +130,7 @@ log_min_messages = warning
 # Connection pooling (tunable via env vars)
 num_init_children = ${NUM_INIT_CHILDREN:-128}
 max_pool = ${MAX_POOL:-4}
-child_life_time = 300
+child_life_time = 0
 connection_life_time = 0
 client_idle_limit = 0
 

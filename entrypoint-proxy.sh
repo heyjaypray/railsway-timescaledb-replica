@@ -142,9 +142,11 @@ log_client_messages = off
 log_min_messages = error
 
 # Connection pooling
-num_init_children = 32
+# Each app replica maintains pool.min (10) persistent connections.
+# With 2 replicas per region + health checks + burst headroom, need ~64 children.
+num_init_children = 64
 max_pool = 4
-child_life_time = 300
+child_life_time = 0
 child_max_connections = 0
 connection_life_time = 0
 client_idle_limit = 0
