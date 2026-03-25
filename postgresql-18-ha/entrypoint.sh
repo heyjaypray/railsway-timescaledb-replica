@@ -160,7 +160,7 @@ memory_cache_enabled = $ENABLE_QUERY_CACHE
 memqcache_method = 'shmem'
 memqcache_total_size = $QUERY_CACHE_SIZE
 memqcache_max_num_cache = 1000000
-memqcache_expire = 60
+memqcache_expire = ${MEMQCACHE_EXPIRE:-300}
 memqcache_auto_cache_invalidation = on
 memqcache_maxcache = 409600
 EOF
