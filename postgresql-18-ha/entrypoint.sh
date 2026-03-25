@@ -416,5 +416,35 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
     chown postgres:postgres "$PG_DATA/postgresql.auto.conf" "$PG_DATA/standby.signal"
 fi
 
+# ── Auto-detect RAM and compute PostgreSQL memory tuning ──
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+
+SHARED_BUFFERS_MB=$((TOTAL_RAM_MB / 4))
+[ "$SHARED_BUFFERS_MB" -lt 256 ] && SHARED_BUFFERS_MB=256
+[ "$SHARED_BUFFERS_MB" -gt 8192 ] && SHARED_BUFFERS_MB=8192
+
+EFFECTIVE_CACHE_MB=$((TOTAL_RAM_MB * 3 / 4))
+[ "$EFFECTIVE_CACHE_MB" -lt 512 ] && EFFECTIVE_CACHE_MB=512
+
+WORK_MEM_MB=$((TOTAL_RAM_MB / 1200))
+[ "$WORK_MEM_MB" -lt 4 ] && WORK_MEM_MB=4
+[ "$WORK_MEM_MB" -gt 64 ] && WORK_MEM_MB=64
+
+MAINT_WORK_MEM_MB=$((TOTAL_RAM_MB / 20))
+[ "$MAINT_WORK_MEM_MB" -lt 64 ] && MAINT_WORK_MEM_MB=64
+[ "$MAINT_WORK_MEM_MB" -gt 2048 ] && MAINT_WORK_MEM_MB=2048
+
+log "Memory tuning: RAM=${TOTAL_RAM_MB}MB shared_buffers=${SHARED_BUFFERS_MB}MB effective_cache=${EFFECTIVE_CACHE_MB}MB work_mem=${WORK_MEM_MB}MB"
+
 log "Starting PostgreSQL 18 HA node in $NODE_ROLE mode..."
-exec docker-entrypoint.sh postgres -c logging_collector=off -c max_connections=300 2>&1
+exec docker-entrypoint.sh postgres \
+    -c logging_collector=off \
+    -c max_connections=300 \
+    -c shared_buffers=${SHARED_BUFFERS_MB}MB \
+    -c effective_cache_size=${EFFECTIVE_CACHE_MB}MB \
+    -c work_mem=${WORK_MEM_MB}MB \
+    -c maintenance_work_mem=${MAINT_WORK_MEM_MB}MB \
+    -c random_page_cost=1.1 \
+    -c effective_io_concurrency=200 \
+    2>&1

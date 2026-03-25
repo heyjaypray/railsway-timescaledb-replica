@@ -2,7 +2,33 @@
 # Configure PostgreSQL BEFORE the main server starts
 # This script runs during initdb phase
 
-# Append to postgresql.conf for pg_cron support and replication
+# ── Auto-detect available RAM and calculate tuning parameters ──
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+
+# shared_buffers: 25% of RAM (PostgreSQL recommendation)
+SHARED_BUFFERS_MB=$((TOTAL_RAM_MB / 4))
+# Minimum 256MB, cap at 8GB (diminishing returns above that)
+[ "$SHARED_BUFFERS_MB" -lt 256 ] && SHARED_BUFFERS_MB=256
+[ "$SHARED_BUFFERS_MB" -gt 8192 ] && SHARED_BUFFERS_MB=8192
+
+# effective_cache_size: 75% of RAM (shared_buffers + OS page cache)
+EFFECTIVE_CACHE_MB=$((TOTAL_RAM_MB * 3 / 4))
+[ "$EFFECTIVE_CACHE_MB" -lt 512 ] && EFFECTIVE_CACHE_MB=512
+
+# work_mem: RAM / (max_connections * 4) — conservative to avoid OOM
+WORK_MEM_MB=$((TOTAL_RAM_MB / 1200))
+[ "$WORK_MEM_MB" -lt 4 ] && WORK_MEM_MB=4
+[ "$WORK_MEM_MB" -gt 64 ] && WORK_MEM_MB=64
+
+# maintenance_work_mem: 5% of RAM (for VACUUM, CREATE INDEX)
+MAINT_WORK_MEM_MB=$((TOTAL_RAM_MB / 20))
+[ "$MAINT_WORK_MEM_MB" -lt 64 ] && MAINT_WORK_MEM_MB=64
+[ "$MAINT_WORK_MEM_MB" -gt 2048 ] && MAINT_WORK_MEM_MB=2048
+
+echo "PostgreSQL auto-tuning: RAM=${TOTAL_RAM_MB}MB shared_buffers=${SHARED_BUFFERS_MB}MB effective_cache=${EFFECTIVE_CACHE_MB}MB work_mem=${WORK_MEM_MB}MB maintenance_work_mem=${MAINT_WORK_MEM_MB}MB"
+
+# Append to postgresql.conf for pg_cron support, replication, and performance
 cat >> "$PGDATA/postgresql.conf" <<EOF
 max_connections = 300
 shared_preload_libraries = 'pg_stat_statements,pg_cron'
@@ -14,6 +40,16 @@ max_wal_senders = 10
 max_replication_slots = 10
 wal_keep_size = 1GB
 hot_standby = on
+
+# ── Memory tuning (auto-detected: ${TOTAL_RAM_MB}MB total RAM) ──
+shared_buffers = ${SHARED_BUFFERS_MB}MB
+effective_cache_size = ${EFFECTIVE_CACHE_MB}MB
+work_mem = ${WORK_MEM_MB}MB
+maintenance_work_mem = ${MAINT_WORK_MEM_MB}MB
+
+# ── Planner tuning (Railway uses SSDs) ──
+random_page_cost = 1.1
+effective_io_concurrency = 200
 EOF
 
 # Configure pg_hba.conf with replication rules (including IPv6 for Railway)
