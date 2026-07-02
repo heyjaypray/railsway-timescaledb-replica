@@ -11,6 +11,13 @@ NC='\033[0m'
 log() { echo -e "${GREEN}[Postgres-HA-$NODE_ROLE]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
+# Shared HA helpers (timeline-arbitrated role reconciliation, pg_rewind rejoin).
+# shellcheck source=/dev/null
+[ -f /usr/local/bin/lib-ha.sh ] && . /usr/local/bin/lib-ha.sh
+
+# Automatic failover is OFF by default. Enable only after validating in staging.
+ENABLE_AUTO_FAILOVER="${ENABLE_AUTO_FAILOVER:-false}"
+
 # Default values for environment variables
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"
@@ -165,6 +172,23 @@ memqcache_auto_cache_invalidation = on
 memqcache_maxcache = 409600
 EOF
 
+    # Automatic failover (opt-in). When enabled, a genuine primary detachment
+    # promotes a surviving standby (failover.sh) and re-points the remaining
+    # standbys at it (follow-primary.sh). When disabled, a detached primary is
+    # only ever re-attached by the background monitor once it is healthy again.
+    if [ "$ENABLE_AUTO_FAILOVER" = "true" ]; then
+        cat >> "$PGPOOL_CONF" <<EOF
+
+# ---- Automatic failover (ENABLE_AUTO_FAILOVER=true) ----
+failover_command = '/usr/local/bin/failover.sh %d %P %m %H'
+follow_primary_command = '/usr/local/bin/follow-primary.sh %d %h %H %m'
+search_primary_node_timeout = 30
+EOF
+        log "Automatic failover ENABLED (promote-on-primary-death + assisted failback)."
+    else
+        log "Automatic failover DISABLED (set ENABLE_AUTO_FAILOVER=true after staging validation)."
+    fi
+
     # Create PCP auth file (server-side: pgpool verifies against this hash)
     PCP_CONF="/etc/pgpool/pcp.conf"
     mkdir -p /etc/pgpool
@@ -218,7 +242,11 @@ EOF
         MAX_NODE=1
         [ -n "$REPLICA_HOST_2" ] && MAX_NODE=2
 
-        # Hostname lookup by node index
+        # Hostname lookup by node index. Node 0 is the PRIMARY: pgpool never
+        # auto-reattaches a detached primary and there is no failover_command,
+        # so without watching node 0 a transient health-check blip leaves the
+        # whole cluster read-only until a manual proxy restart.
+        NODE_HOST_0="$PRIMARY_HOST"
         NODE_HOST_1="$REPLICA_HOST"
         NODE_HOST_2="${REPLICA_HOST_2:-}"
 
@@ -227,7 +255,7 @@ EOF
             sleep 20
             CYCLE=$((CYCLE+1))
 
-            for NODE_ID in $(seq 1 $MAX_NODE); do
+            for NODE_ID in $(seq 0 $MAX_NODE); do
                 eval "HOST=\$NODE_HOST_${NODE_ID}"
                 [ -z "$HOST" ] && continue
 
@@ -236,6 +264,25 @@ EOF
                     NODE_STATUS=$(echo "$NODE_INFO" | cut -d' ' -f3)
 
                     if [ "$NODE_STATUS" = "down" ] || [ "$NODE_STATUS" = "3" ]; then
+                        # Safety guard for the primary (node 0). Re-attaching is
+                        # safe when node 0 is a standby (in_recovery=t) or when it
+                        # is the ONLY primary pgpool knows. It is UNSAFE — and
+                        # refused — when node 0 claims primary while another node
+                        # is already primary (a stale ex-primary after failover;
+                        # it must be pg_rewind'd back to a standby first, which the
+                        # node does automatically on its next boot).
+                        if [ "$NODE_ID" = "0" ]; then
+                            IN_RECOVERY=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$HOST" -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+                            if [ "$IN_RECOVERY" = "f" ]; then
+                                if [ "$(ha_pgpool_has_other_primary 0)" = "yes" ]; then
+                                    [ $((CYCLE % 6)) -eq 0 ] && warn "Node 0 ($HOST) claims primary but another primary is active; NOT re-attaching (stale ex-primary awaiting pg_rewind)."
+                                    continue
+                                fi
+                            elif [ "$IN_RECOVERY" != "t" ]; then
+                                # Role indeterminate — be conservative, skip this cycle.
+                                continue
+                            fi
+                        fi
                         log "Node $NODE_ID ($HOST) is alive but PgPool shows status=$NODE_STATUS. Re-attaching..."
                         RESULT=$(pcp_attach_node -h localhost -p 9898 -U "$POSTGRES_USER" -w -n $NODE_ID 2>&1)
                         RC=$?
@@ -274,6 +321,28 @@ chown -R postgres:postgres /var/lib/postgresql/data
 
 # --- PRIMARY SETUP WITH RESILIENCE ---
 if [ "$NODE_ROLE" = "PRIMARY" ]; then
+
+    # Split-brain guard: if auto-failover is enabled and this node already has
+    # data, check whether a peer was promoted while we were gone (higher
+    # timeline). If so, we are a stale ex-primary — rejoin as that node's
+    # standby via pg_rewind instead of starting as a competing primary.
+    PRIMARY_BECOMES_STANDBY=""
+    if [ "$ENABLE_AUTO_FAILOVER" = "true" ] && [ -s "$PG_DATA/PG_VERSION" ] && [ -n "$PEER_HOSTS" ]; then
+        log "Primary: reconciling role against peers ($PEER_HOSTS)..."
+        RECONCILE_ACTION="primary"
+        ha_reconcile_role "$PEER_HOSTS"
+        if [ "${RECONCILE_ACTION%%:*}" = "standby" ]; then
+            PRIMARY_BECOMES_STANDBY="${RECONCILE_ACTION#standby:}"
+            log "Primary: a newer primary exists ($PRIMARY_BECOMES_STANDBY). Rejoining as standby."
+            ha_rejoin_as_standby "$PRIMARY_BECOMES_STANDBY"
+        else
+            log "Primary: confirmed as legitimate primary (highest timeline)."
+        fi
+    fi
+
+fi
+
+if [ "$NODE_ROLE" = "PRIMARY" ] && [ -z "$PRIMARY_BECOMES_STANDBY" ]; then
     (
         set +e
         log "Primary: Background maintenance thread started."
@@ -389,31 +458,55 @@ fi
 if [ "$NODE_ROLE" = "REPLICA" ]; then
     SLOT_NAME="replica_slot_${REPLICA_ID}"
     APP_NAME="replica${REPLICA_ID}"
-    
+
     log "Replica $REPLICA_ID: Initializing sync logic using slot '$SLOT_NAME'..."
-    
-    if [ ! -s "$PG_DATA/PG_VERSION" ]; then
-        log "Replica $REPLICA_ID: Cloning data from $PRIMARY_HOST..."
-        until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
-        rm -rf "$PG_DATA"/*
-        until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$PRIMARY_HOST" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=$SLOT_NAME --checkpoint=fast; do
-            warn "Waiting for primary to be ready for backup..."
-            sleep 10
-        done
-        log "Replica $REPLICA_ID: Sync complete."
+
+    # Resolve the CURRENT primary. After a failover the static PRIMARY_HOST may
+    # point at a demoted/dead node, so when auto-failover is on we discover the
+    # real primary (highest-timeline reachable node) among the peers.
+    EFFECTIVE_PRIMARY="$PRIMARY_HOST"
+    if [ "$ENABLE_AUTO_FAILOVER" = "true" ] && [ -n "$PEER_HOSTS" ]; then
+        DISCOVERED=$(ha_discover_primary "$PEER_HOSTS")
+        [ -n "$DISCOVERED" ] && EFFECTIVE_PRIMARY="$DISCOVERED"
+        log "Replica $REPLICA_ID: current primary resolved to $EFFECTIVE_PRIMARY"
     fi
-    
-    # Update postgresql.auto.conf with unique slot based on REPLICA_ID
-    ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
-    
-    sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
-    sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
-    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=$APP_NAME'" >> "$PG_DATA/postgresql.auto.conf"
-    echo "primary_slot_name = '$SLOT_NAME'" >> "$PG_DATA/postgresql.auto.conf"
-    
-    # Ensure standby.signal exists
-    touch "$PG_DATA/standby.signal"
-    chown postgres:postgres "$PG_DATA/postgresql.auto.conf" "$PG_DATA/standby.signal"
+
+    if [ "$ENABLE_AUTO_FAILOVER" = "true" ] && [ -s "$PG_DATA/PG_VERSION" ] && [ ! -f "$PG_DATA/standby.signal" ]; then
+        # This replica was previously PROMOTED (data present, no standby.signal).
+        # Do NOT blindly re-add standby.signal — it may still be the legitimate
+        # primary. Reconcile by timeline: yield only to a newer primary.
+        log "Replica $REPLICA_ID: no standby.signal present (was promoted). Reconciling role..."
+        RECONCILE_ACTION="primary"
+        ha_reconcile_role "$PEER_HOSTS"
+        if [ "${RECONCILE_ACTION%%:*}" = "standby" ]; then
+            ha_rejoin_as_standby "${RECONCILE_ACTION#standby:}"
+        else
+            log "Replica $REPLICA_ID: still the legitimate primary; starting without standby config."
+        fi
+    else
+        # Normal standby path: fresh clone if empty, then follow current primary.
+        if [ ! -s "$PG_DATA/PG_VERSION" ]; then
+            log "Replica $REPLICA_ID: Cloning data from $EFFECTIVE_PRIMARY..."
+            until pg_isready -h "$EFFECTIVE_PRIMARY" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
+            rm -rf "$PG_DATA"/*
+            until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$EFFECTIVE_PRIMARY" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=$SLOT_NAME --checkpoint=fast; do
+                warn "Waiting for primary to be ready for backup..."
+                sleep 10
+            done
+            log "Replica $REPLICA_ID: Sync complete."
+        fi
+
+        # Point at the current primary with our unique slot.
+        ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
+        sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+        sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+        echo "primary_conninfo = 'host=$EFFECTIVE_PRIMARY port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=$APP_NAME'" >> "$PG_DATA/postgresql.auto.conf"
+        echo "primary_slot_name = '$SLOT_NAME'" >> "$PG_DATA/postgresql.auto.conf"
+
+        # Ensure standby.signal exists
+        touch "$PG_DATA/standby.signal"
+        chown postgres:postgres "$PG_DATA/postgresql.auto.conf" "$PG_DATA/standby.signal"
+    fi
 fi
 
 # ── Auto-detect RAM and compute PostgreSQL memory tuning ──
@@ -447,4 +540,5 @@ exec docker-entrypoint.sh postgres \
     -c maintenance_work_mem=${MAINT_WORK_MEM_MB}MB \
     -c random_page_cost=1.1 \
     -c effective_io_concurrency=200 \
+    -c wal_log_hints=on \
     2>&1

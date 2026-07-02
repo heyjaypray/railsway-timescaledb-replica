@@ -7,6 +7,11 @@
             "config": {
                 "length": 32
             }
+        },
+        "ENABLE_AUTO_FAILOVER": {
+            "description": "Enable automatic failover + assisted failback. Leave 'false' until validated in staging.",
+            "label": "Enable Auto Failover",
+            "default": "false"
         }
     },
     "services": {
@@ -17,7 +22,9 @@
             "env": {
                 "NODE_ROLE": "PRIMARY",
                 "PGDATA": "/var/lib/postgresql/data/pgdata",
-                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}"
+                "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
+                "ENABLE_AUTO_FAILOVER": "${{ENABLE_AUTO_FAILOVER}}",
+                "PEER_HOSTS": "${{postgres-18-replica.RAILWAY_PRIVATE_DOMAIN}}"
             },
             "mounts": [
                 {
@@ -34,7 +41,9 @@
                 "NODE_ROLE": "REPLICA",
                 "PGDATA": "/var/lib/postgresql/data/pgdata",
                 "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
-                "PRIMARY_HOST": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}"
+                "PRIMARY_HOST": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}",
+                "ENABLE_AUTO_FAILOVER": "${{ENABLE_AUTO_FAILOVER}}",
+                "PEER_HOSTS": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}"
             },
             "mounts": [
                 {
@@ -51,7 +60,8 @@
                 "NODE_ROLE": "PROXY",
                 "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
                 "PRIMARY_HOST": "${{postgres-18-primary.RAILWAY_PRIVATE_DOMAIN}}",
-                "REPLICA_HOST": "${{postgres-18-replica.RAILWAY_PRIVATE_DOMAIN}}"
+                "REPLICA_HOST": "${{postgres-18-replica.RAILWAY_PRIVATE_DOMAIN}}",
+                "ENABLE_AUTO_FAILOVER": "${{ENABLE_AUTO_FAILOVER}}"
             }
         }
     }
