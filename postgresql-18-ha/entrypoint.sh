@@ -25,14 +25,14 @@ REPLICATION_USER="${REPLICATION_USER:-replicator}"
 REPLICA_ID="${REPLICA_ID:-1}"
 MAX_REPLICAS="${MAX_REPLICAS:-2}"
 
-# Read routing defaults (optimized for READ FRESHNESS, not read scaling)
-# All reads go to the PRIMARY so a write on the primary is immediately
-# visible to every user. The replica stays attached (weight 0) as a hot
-# standby for failover, it just doesn't serve stale reads. This prevents
-# the "someone edited an order but I don't see it after refresh" class of
-# bug caused by async streaming-replication lag (worse cross-region).
-# To restore read-scaling (at the cost of replica-lag staleness), set
-# READ_WEIGHT_PRIMARY=0 and READ_WEIGHT_REPLICA=1 via Railway env vars.
+# Read routing is set to READ FRESHNESS (not read scaling) via
+# load_balance_mode = off in the pgpool config below, which sends all reads
+# to the current primary by ROLE and survives failover. That prevents the
+# "someone edited an order but I don't see it after refresh" class of bug
+# caused by async streaming-replication lag (worse cross-region).
+# These READ_WEIGHT_* values are inert while load balancing is off; they
+# only take effect if load_balance_mode is turned back on to re-enable
+# read-scaling across replicas.
 READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-1}"
 READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-0}"
 READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-$READ_WEIGHT_REPLICA}"
@@ -99,7 +99,15 @@ EOF
     cat >> "$PGPOOL_CONF" <<EOF
 
 backend_clustering_mode = 'streaming_replication'
-load_balance_mode = on
+# Read freshness over read scaling: with load balancing OFF, pgpool sends
+# EVERY query to whichever node is currently the primary (by role, not by
+# node index). Reads are therefore always current, and this survives a
+# failover — if a standby is promoted, reads follow it automatically. This
+# supersedes the READ_WEIGHT_* weights (they only apply when load balancing
+# is on, so they are now inert). To restore read-scaling across replicas
+# (at the cost of replica-lag staleness), set load_balance_mode = on and
+# give the replicas a non-zero READ_WEIGHT_REPLICA.
+load_balance_mode = off
 
 # Session handling for pgx/Go compatibility
 statement_level_load_balance = on
