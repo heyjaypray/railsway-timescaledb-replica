@@ -40,6 +40,8 @@ max_wal_senders = 10
 max_replication_slots = 10
 wal_keep_size = 1GB
 hot_standby = on
+# Required for pg_rewind-based failback (rejoining an old primary as a standby)
+wal_log_hints = on
 
 # ── Memory tuning (auto-detected: ${TOTAL_RAM_MB}MB total RAM) ──
 shared_buffers = ${SHARED_BUFFERS_MB}MB

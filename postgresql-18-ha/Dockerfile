@@ -17,6 +17,10 @@ RUN apt-get update && apt-get install -y \
 # Copy scripts
 COPY entrypoint.sh /usr/local/bin/entrypoint-custom.sh
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+COPY lib-ha.sh /usr/local/bin/lib-ha.sh
+COPY failover.sh /usr/local/bin/failover.sh
+COPY follow-primary.sh /usr/local/bin/follow-primary.sh
+COPY switchover.sh /usr/local/bin/switchover.sh
 
 # Initialize extensions script (runs DURING initdb, before first server start)
 RUN mkdir -p /docker-entrypoint-initdb.d
@@ -25,6 +29,8 @@ COPY init-extensions.sql /docker-entrypoint-initdb.d/10-init-extensions.sql
 
 # Make executable
 RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh \
+    /usr/local/bin/lib-ha.sh /usr/local/bin/failover.sh \
+    /usr/local/bin/follow-primary.sh /usr/local/bin/switchover.sh \
     /docker-entrypoint-initdb.d/00-configure-postgres.sh
 
 # Set environment defaults
@@ -35,6 +41,10 @@ ENV NODE_ROLE=PRIMARY
 ENV TZ=Asia/Bangkok
 ENV REPLICA_ID=1
 ENV MAX_REPLICAS=2
+
+# Automatic failover is OFF by default. Enable (ENABLE_AUTO_FAILOVER=true) only
+# after validating in staging. Requires PEER_HOSTS set on each DB service.
+ENV ENABLE_AUTO_FAILOVER=false
 
 # Performance tuning (optimized for fast reads)
 ENV READ_WEIGHT_PRIMARY=0
