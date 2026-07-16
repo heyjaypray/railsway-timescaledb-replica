@@ -412,6 +412,10 @@ END \$\$;
 -- Configure for better replication
 ALTER SYSTEM SET max_connections = 300;
 ALTER SYSTEM SET wal_keep_size = '1GB';
+-- Bound WAL retained per slot so an orphaned/abandoned slot (a removed or
+-- renumbered replica whose slot is never dropped) can't retain WAL forever and
+-- fill the volume. Past this the slot is invalidated and its WAL is reclaimable.
+ALTER SYSTEM SET max_slot_wal_keep_size = '4GB';
 ALTER SYSTEM SET max_replication_slots = 10;
 ALTER SYSTEM SET max_wal_senders = 10;
 

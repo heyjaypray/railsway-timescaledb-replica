@@ -39,6 +39,12 @@ wal_level = replica
 max_wal_senders = 10
 max_replication_slots = 10
 wal_keep_size = 1GB
+# Cap WAL retained for a single slot. Without this (-1 = unlimited) an
+# orphaned/abandoned slot — e.g. a removed or renumbered replica whose slot is
+# never dropped — retains WAL forever and fills the volume. Past this bound the
+# slot is invalidated (marked 'lost') and its WAL becomes reclaimable, trading a
+# stale replica's resync for a bounded disk. Keep comfortably above wal_keep_size.
+max_slot_wal_keep_size = 4GB
 hot_standby = on
 # Required for pg_rewind-based failback (rejoining an old primary as a standby)
 wal_log_hints = on
