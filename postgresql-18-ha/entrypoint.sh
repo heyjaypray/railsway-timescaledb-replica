@@ -18,12 +18,22 @@ REPLICATION_USER="${REPLICATION_USER:-replicator}"
 REPLICA_ID="${REPLICA_ID:-1}"
 MAX_REPLICAS="${MAX_REPLICAS:-2}"
 
-# Performance tuning defaults (optimized for fast reads)
-READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"
-READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"
+# Read routing defaults (optimized for READ FRESHNESS, not read scaling)
+# All reads go to the PRIMARY so a write on the primary is immediately
+# visible to every user. The replica stays attached (weight 0) as a hot
+# standby for failover, it just doesn't serve stale reads. This prevents
+# the "someone edited an order but I don't see it after refresh" class of
+# bug caused by async streaming-replication lag (worse cross-region).
+# To restore read-scaling (at the cost of replica-lag staleness), set
+# READ_WEIGHT_PRIMARY=0 and READ_WEIGHT_REPLICA=1 via Railway env vars.
+READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-1}"
+READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-0}"
 READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-$READ_WEIGHT_REPLICA}"
 DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"
-ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
+# Pgpool in-memory query cache OFF: it can serve a cached SELECT for up to
+# memqcache_expire seconds and is a second source of stale reads. Freshness
+# is the priority here, so leave it off unless read load demands otherwise.
+ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-off}"
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
 LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-dml_adaptive}"
 
