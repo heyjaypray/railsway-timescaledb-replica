@@ -25,22 +25,52 @@ REPLICATION_USER="${REPLICATION_USER:-replicator}"
 REPLICA_ID="${REPLICA_ID:-1}"
 MAX_REPLICAS="${MAX_REPLICAS:-2}"
 
-# Read routing is set to READ FRESHNESS (not read scaling) via
-# load_balance_mode = off in the pgpool config below, which sends all reads
-# to the current primary by ROLE and survives failover. That prevents the
-# "someone edited an order but I don't see it after refresh" class of bug
-# caused by async streaming-replication lag (worse cross-region).
-# These READ_WEIGHT_* values are inert while load balancing is off; they
-# only take effect if load_balance_mode is turned back on to re-enable
-# read-scaling across replicas.
-READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-1}"
-READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-0}"
+# ── Read routing: replicas serve reads; staleness is fixed at its source ──
+# Reads are load-balanced to the replica(s) so the primary is left for writes.
+# The staleness that normally buys — "someone edited an order and I don't see
+# it after a refresh" — is attacked where it originates rather than by routing
+# reads away from the replicas:
+#   1. hot_standby_feedback + max_standby_streaming_delay below stop a replica
+#      from PAUSING WAL replay when a read query conflicts with recovery. That
+#      pause is up to 30s by default and dwarfs actual network lag.
+#   2. delay_threshold(_by_time) pulls a measurably-behind replica out of the
+#      read rotation until it catches up; those reads fall back to the primary.
+#   3. sr_check_period bounds how long a lagging replica goes unnoticed.
+#
+# WARNING: every ':-' default below applies ONLY when the variable is unset. Do
+# not reintroduce ENV defaults for these in the Dockerfile — an ENV is always
+# *set*, so it silently beats every default here and turns this block into dead
+# code. Override per-environment via railway.json or Railway service variables.
+READ_WEIGHT_PRIMARY="${READ_WEIGHT_PRIMARY:-0}"
+READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"
 READ_WEIGHT_REPLICA_2="${READ_WEIGHT_REPLICA_2:-$READ_WEIGHT_REPLICA}"
-DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"
-# Pgpool in-memory query cache OFF: it can serve a cached SELECT for up to
-# memqcache_expire seconds and is a second source of stale reads. Freshness
-# is the priority here, so leave it off unless read load demands otherwise.
-ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-off}"
+
+# Drop a replica from the read rotation once it is this far behind. Bytes is the
+# only unit Pgpool-II < 4.4 understands and it is a poor proxy for staleness (a
+# single order edit is only a few KB), so it is set tight; on >= 4.4 the
+# millisecond threshold is emitted too and is the meaningful one. Exclusion is
+# graceful — those reads simply go to the primary until the replica catches up.
+DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-102400}"
+DELAY_THRESHOLD_MS="${DELAY_THRESHOLD_MS:-500}"
+SR_CHECK_PERIOD="${SR_CHECK_PERIOD:-5}"
+
+# Replica replay tuning (applied to the postgres command line further down).
+# hot_standby_feedback=on tells the primary not to vacuum rows a replica query
+# still needs, which is the main cause of recovery conflicts; it costs some
+# bloat on the primary when a replica runs long queries. With it on the replay
+# pause cap below should rarely fire — when it does, it cancels the conflicting
+# replica query instead of letting the replica drift further behind.
+HOT_STANDBY_FEEDBACK="${HOT_STANDBY_FEEDBACK:-on}"
+MAX_STANDBY_STREAMING_DELAY="${MAX_STANDBY_STREAMING_DELAY:-5s}"
+
+# Pgpool in-memory query cache. Kept on for read performance: writes that cross
+# the proxy auto-invalidate cached SELECTs for the tables they touch, so
+# memqcache_expire is only a backstop for writes pgpool cannot see — notably
+# pg_cron jobs, which run inside the database and never pass through pgpool.
+# This is the one remaining known staleness source: set ENABLE_QUERY_CACHE=off
+# on the proxy service if stale reads survive the changes above.
+ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"
+MEMQCACHE_EXPIRE="${MEMQCACHE_EXPIRE:-60}"
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"
 LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-dml_adaptive}"
 
@@ -66,7 +96,28 @@ if [ "$NODE_ROLE" = "PROXY" ]; then
     
     # Escape single quotes in password for config safety
     ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
-    
+
+    # delay_threshold_by_time measures replica lag in milliseconds instead of
+    # WAL bytes — the only threshold that actually corresponds to "how stale can
+    # a read be". It exists only in Pgpool-II >= 4.4, and an unrecognised key in
+    # pgpool.conf is fatal, so probe the installed version rather than assume it.
+    # (The Debian package version moves with the base image, so this must not be
+    # hardcoded.) On older pgpool we silently fall back to the byte threshold.
+    PGPOOL_VERSION=$(pgpool --version 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+    PGPOOL_MAJOR=$(printf '%s' "$PGPOOL_VERSION" | cut -d. -f1)
+    PGPOOL_MINOR=$(printf '%s' "$PGPOOL_VERSION" | cut -d. -f2)
+    case "$PGPOOL_MAJOR" in ''|*[!0-9]*) PGPOOL_MAJOR=0 ;; esac
+    case "$PGPOOL_MINOR" in ''|*[!0-9]*) PGPOOL_MINOR=0 ;; esac
+
+    DELAY_BY_TIME_LINE=""
+    if [ "$PGPOOL_MAJOR" -gt 4 ] || { [ "$PGPOOL_MAJOR" -eq 4 ] && [ "$PGPOOL_MINOR" -ge 4 ]; }; then
+        DELAY_BY_TIME_LINE="delay_threshold_by_time = $DELAY_THRESHOLD_MS"
+        log "Pgpool-II ${PGPOOL_VERSION}: using time-based replication delay threshold (${DELAY_THRESHOLD_MS}ms)."
+    else
+        warn "Pgpool-II ${PGPOOL_VERSION:-unknown} predates 4.4: no time-based delay threshold."
+        warn "Falling back to delay_threshold = ${DELAY_THRESHOLD_BYTES} bytes, which bounds replica lag only loosely."
+    fi
+
     cat > "$PGPOOL_CONF" <<EOF
 listen_addresses = '*'
 port = 5432
@@ -99,15 +150,13 @@ EOF
     cat >> "$PGPOOL_CONF" <<EOF
 
 backend_clustering_mode = 'streaming_replication'
-# Read freshness over read scaling: with load balancing OFF, pgpool sends
-# EVERY query to whichever node is currently the primary (by role, not by
-# node index). Reads are therefore always current, and this survives a
-# failover — if a standby is promoted, reads follow it automatically. This
-# supersedes the READ_WEIGHT_* weights (they only apply when load balancing
-# is on, so they are now inert). To restore read-scaling across replicas
-# (at the cost of replica-lag staleness), set load_balance_mode = on and
-# give the replicas a non-zero READ_WEIGHT_REPLICA.
-load_balance_mode = off
+# Reads are load-balanced across the replicas per READ_WEIGHT_*; writes always
+# go to the primary. Read staleness is bounded by the delay thresholds below
+# plus the replica replay tuning, rather than by keeping reads off the replicas.
+# To trade read throughput for absolute freshness, set this to off: pgpool then
+# sends every query to whichever node is currently primary BY ROLE, so it also
+# survives a failover. That costs roughly a doubling of primary read load.
+load_balance_mode = on
 
 # Session handling for pgx/Go compatibility
 statement_level_load_balance = on
@@ -146,12 +195,18 @@ failover_on_backend_error = off
 failover_on_backend_shutdown = off
 detach_false_primary = off
 
-# Streaming Replication Check - Relaxed to avoid false positives
-sr_check_period = 15
+# Streaming Replication Check — how often pgpool samples each replica's lag and
+# how far behind one may fall before it stops receiving load-balanced reads.
+# sr_check_period is the blind window: a replica that falls behind keeps serving
+# stale reads until the next sample, so it is deliberately short here. This is
+# NOT the health check above and a false positive is cheap — it only parks reads
+# on the primary for a few seconds; it never detaches a node or fails a query.
+sr_check_period = $SR_CHECK_PERIOD
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
 delay_threshold = $DELAY_THRESHOLD_BYTES
+$DELAY_BY_TIME_LINE
 
 # Logging (use warning in production, info for debugging)
 log_min_messages = warning
@@ -185,7 +240,7 @@ memory_cache_enabled = $ENABLE_QUERY_CACHE
 memqcache_method = 'shmem'
 memqcache_total_size = $QUERY_CACHE_SIZE
 memqcache_max_num_cache = 1000000
-memqcache_expire = ${MEMQCACHE_EXPIRE:-300}
+memqcache_expire = $MEMQCACHE_EXPIRE
 memqcache_auto_cache_invalidation = on
 memqcache_maxcache = 409600
 EOF
@@ -553,6 +608,14 @@ MAINT_WORK_MEM_MB=$((TOTAL_RAM_MB / 20))
 log "Memory tuning: RAM=${TOTAL_RAM_MB}MB shared_buffers=${SHARED_BUFFERS_MB}MB effective_cache=${EFFECTIVE_CACHE_MB}MB work_mem=${WORK_MEM_MB}MB"
 
 log "Starting PostgreSQL 18 HA node in $NODE_ROLE mode..."
+# Replay tuning is passed on the command line, not written to postgresql.conf by
+# 00-configure-postgres.sh, because that script only runs during initdb — an
+# already-provisioned volume would never pick the settings up. Command-line
+# options also outrank postgresql.conf, so they cannot be shadowed by a stale
+# value left behind on an existing volume.
+#
+# hot_standby_feedback / max_standby_streaming_delay are standby-side settings
+# and are simply inert on the primary, so both roles can share this line.
 exec docker-entrypoint.sh postgres \
     -c logging_collector=off \
     -c max_connections=300 \
@@ -563,4 +626,6 @@ exec docker-entrypoint.sh postgres \
     -c random_page_cost=1.1 \
     -c effective_io_concurrency=200 \
     -c wal_log_hints=on \
+    -c hot_standby_feedback=${HOT_STANDBY_FEEDBACK} \
+    -c max_standby_streaming_delay=${MAX_STANDBY_STREAMING_DELAY} \
     2>&1

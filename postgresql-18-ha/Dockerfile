@@ -46,13 +46,14 @@ ENV MAX_REPLICAS=2
 # after validating in staging. Requires PEER_HOSTS set on each DB service.
 ENV ENABLE_AUTO_FAILOVER=false
 
-# Performance tuning (optimized for fast reads)
-ENV READ_WEIGHT_PRIMARY=0
-ENV READ_WEIGHT_REPLICA=1
-ENV DELAY_THRESHOLD_BYTES=1000000
-ENV ENABLE_QUERY_CACHE=on
-ENV QUERY_CACHE_SIZE=67108864
-ENV LOAD_BALANCE_ON_WRITE=dml_adaptive
+# Read-routing / replication-lag tuning is deliberately NOT declared here.
+# entrypoint.sh already defines each of these with a '${VAR:-default}' fallback,
+# and an ENV is always *set* — so declaring one here silently overrides that
+# fallback and makes the entrypoint's default dead code. That is not
+# hypothetical: READ_WEIGHT_* and ENABLE_QUERY_CACHE used to live here and
+# quietly beat every change made in entrypoint.sh.
+# entrypoint.sh is the single source of truth; override per-environment via
+# railway.json or Railway service variables, which outrank both.
 
 # Healthcheck
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
