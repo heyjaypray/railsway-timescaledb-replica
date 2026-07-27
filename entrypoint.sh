@@ -41,7 +41,10 @@ READ_WEIGHT_REPLICA="${READ_WEIGHT_REPLICA:-1}"       # Weight for each replica
 DELAY_THRESHOLD_BYTES="${DELAY_THRESHOLD_BYTES:-1000000}"  # 1MB - remove lagging replicas
 ENABLE_QUERY_CACHE="${ENABLE_QUERY_CACHE:-on}"        # Cache repeated queries
 QUERY_CACHE_SIZE="${QUERY_CACHE_SIZE:-67108864}"      # 64MB cache
-LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-transaction}"  # Prevent stale reads after write
+# 'always': once a session has written, it never load balances again. 'transaction'
+# only covers reads inside the writing transaction, which does nothing for an
+# autocommit ORM like Strapi that writes and then re-reads on separate statements.
+LOAD_BALANCE_ON_WRITE="${LOAD_BALANCE_ON_WRITE:-always}"  # Prevent stale reads after write
 
 log "Starting TimescaleDB HA Entrypoint v2.0..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER, ROLE=$NODE_ROLE"
@@ -125,9 +128,21 @@ statement_level_load_balance = on
 disable_load_balance_on_write = '$LOAD_BALANCE_ON_WRITE'
 allow_sql_comments = on
 
-# Load balance preferences - force standby for reads
-database_redirect_preference_list = 'postgres:standby'
-app_name_redirect_preference_list = 'psql:standby,pgadmin:standby,dbeaver:standby'
+# Load balance preferences
+#
+# Do NOT blanket-redirect the application database to a standby. Strapi is a
+# read-your-writes ORM: it introspects the schema and re-reads rows it just
+# wrote, in autocommit, outside any transaction. Every one of those reads served
+# by a lagging standby is a pre-write snapshot, which at boot shows up as a
+# bogus schema diff (ALTER TABLE ... DROP CONSTRAINT ... "does not exist") or a
+# query against a table the standby hasn't replayed yet (i18n_locale) — the
+# server then crash-loops. Money is derived on read here too (balance =
+# total - sum(transactions)), so a stale read is a wrong number, not just slow.
+#
+# Pin strapi to the primary by application_name; interactive clients still
+# load balance to standbys, as do any other apps via backend_weight.
+database_redirect_preference_list = ''
+app_name_redirect_preference_list = 'strapi:primary,psql:standby,pgadmin:standby,dbeaver:standby'
 
 # Allow all functions to be load balanced (empty = all allowed)
 black_function_list = ''
